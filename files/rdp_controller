@@ -1,5 +1,5 @@
 config rdp_controller 'main'
-	option enabled '0'
+	option enabled '1'
 	option port '8080'
 	option auth_enabled '0'
 	option password ''
