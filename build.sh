@@ -1,51 +1,54 @@
-#!/bin/bash
-# OpenWrt IPK Build Script - FINAL FIX
+#!/usr/bin/env python3
+"""
+Build script for rdp-controller OpenWrt IPK package.
+Run: python3 build.sh
 
-PACKAGE_NAME=rdp-controller
-PACKAGE_VERSION=1.0.0
-PACKAGE_ARCH=all
-SOURCE_DIR=$(pwd)
-BUILD_DIR=/tmp/ipk-build-$$
+OpenWrt IPK format: gzip-compressed tar containing
+  ./debian-binary, ./data.tar.gz, ./control.tar.gz
+"""
 
-# Cleanup previous
-rm -f "${SOURCE_DIR}"/*.ipk
+import tarfile, io, gzip, os, sys
 
-# Create build dir in Linux FS (WSL tmp)
-rm -rf $BUILD_DIR
-mkdir -p $BUILD_DIR
-cd $BUILD_DIR || exit 1
+PACKAGE_NAME    = "rdp-controller"
+PACKAGE_VERSION = "1.0.0"
+PACKAGE_ARCH    = "all"
 
-# Create directories
-mkdir -p usr/bin etc/config etc/init.d
-mkdir -p usr/lib/lua/luci/controller
-mkdir -p usr/lib/lua/luci/model/cbi
+SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
+OUTPUT     = os.path.join(SOURCE_DIR, f"{PACKAGE_NAME}_{PACKAGE_VERSION}_{PACKAGE_ARCH}.ipk")
 
-# Copy files from source
-cp "${SOURCE_DIR}/files/rdp_controller.py" usr/bin/
-cp "${SOURCE_DIR}/files/rdp_controller" etc/config/
-cp "${SOURCE_DIR}/files/rdp_controller.init" etc/init.d/rdp_controller
-cp "${SOURCE_DIR}/luci/controller/rdp_controller.lua" usr/lib/lua/luci/controller/
-cp "${SOURCE_DIR}/luci/model/cbi/rdp_controller.lua" usr/lib/lua/luci/model/cbi/
+def read(path):
+    with open(path, 'rb') as f:
+        return f.read()
 
-# Set permissions (WSL can do this on tmp)
-chmod 755 usr/bin/rdp_controller.py
-chmod 755 etc/init.d/rdp_controller
+def file_entry(name, data, mode=0o644):
+    ti = tarfile.TarInfo(name=name)
+    ti.type = tarfile.REGTYPE
+    ti.mode = mode
+    ti.size = len(data)
+    ti.mtime = ti.uid = ti.gid = 0
+    ti.uname = ti.gname = "root"
+    return ti, io.BytesIO(data)
 
-# Create control files in separate dir
-mkdir -p CONTROL_FILES
+def dir_entry(name, mode=0o755):
+    ti = tarfile.TarInfo(name=name)
+    ti.type = tarfile.DIRTYPE
+    ti.mode = mode
+    ti.size = ti.mtime = ti.uid = ti.gid = 0
+    ti.uname = ti.gname = "root"
+    return ti
 
-cat > CONTROL_FILES/control << 'EOF'
-Package: rdp-controller
-Version: 1.0.0
-Architecture: all
+CONTROL = f"""\
+Package: {PACKAGE_NAME}
+Version: {PACKAGE_VERSION}
+Architecture: {PACKAGE_ARCH}
 Section: net
 Priority: optional
-Maintainer: Your Name
+Maintainer: ricklxf90@gmail.com
 Depends: python3, luci
-Description: RDP Port Forwarding Controller
-EOF
+Description: RDP Port Forwarding Controller with countdown timer and Feishu notifications
+""".encode()
 
-cat > CONTROL_FILES/postinst << 'EOF'
+POSTINST = b"""\
 #!/bin/sh
 if [ -z "$IPKG_INSTROOT" ]; then
     chmod +x /usr/bin/rdp_controller.py 2>/dev/null || true
@@ -53,34 +56,55 @@ if [ -z "$IPKG_INSTROOT" ]; then
     /etc/init.d/rdp_controller enable 2>/dev/null || true
 fi
 exit 0
-EOF
+"""
 
-cat > CONTROL_FILES/prerm << 'EOF'
+PRERM = b"""\
 #!/bin/sh
 if [ -z "$IPKG_INSTROOT" ]; then
     /etc/init.d/rdp_controller stop 2>/dev/null || true
     /etc/init.d/rdp_controller disable 2>/dev/null || true
 fi
 exit 0
-EOF
+"""
 
-chmod 755 CONTROL_FILES/postinst CONTROL_FILES/prerm
+# control.tar.gz
+ctrl_buf = io.BytesIO()
+with tarfile.open(fileobj=ctrl_buf, mode='w:gz', format=tarfile.USTAR_FORMAT) as t:
+    t.addfile(dir_entry("."))
+    t.addfile(*file_entry("./control",  CONTROL,  0o644))
+    t.addfile(*file_entry("./postinst", POSTINST, 0o755))
+    t.addfile(*file_entry("./prerm",    PRERM,    0o755))
 
-# Create tarballs (CRITICAL: create without ./ prefix)
-echo "2.0" > debian-binary
-cd CONTROL_FILES
-tar czf ../control.tar.gz control postinst prerm
-cd ..
-tar czf data.tar.gz usr etc
+# data.tar.gz
+data_buf = io.BytesIO()
+with tarfile.open(fileobj=data_buf, mode='w:gz', format=tarfile.USTAR_FORMAT) as t:
+    t.addfile(dir_entry("."))
+    for d in ["./usr", "./usr/bin",
+              "./usr/lib", "./usr/lib/lua", "./usr/lib/lua/luci",
+              "./usr/lib/lua/luci/controller",
+              "./usr/lib/lua/luci/model", "./usr/lib/lua/luci/model/cbi",
+              "./etc", "./etc/config", "./etc/init.d"]:
+        t.addfile(dir_entry(d))
+    t.addfile(*file_entry("./usr/bin/rdp_controller.py",
+        read(f"{SOURCE_DIR}/files/rdp_controller.py"), 0o755))
+    t.addfile(*file_entry("./usr/lib/lua/luci/controller/rdp_controller.lua",
+        read(f"{SOURCE_DIR}/luci/controller/rdp_controller.lua"), 0o644))
+    t.addfile(*file_entry("./usr/lib/lua/luci/model/cbi/rdp_controller.lua",
+        read(f"{SOURCE_DIR}/luci/model/cbi/rdp_controller.lua"), 0o644))
+    t.addfile(*file_entry("./etc/config/rdp_controller",
+        read(f"{SOURCE_DIR}/files/rdp_controller"), 0o644))
+    t.addfile(*file_entry("./etc/init.d/rdp_controller",
+        read(f"{SOURCE_DIR}/files/rdp_controller.init"), 0o755))
 
-# Final IPK
-OUTPUT_FILE="${PACKAGE_NAME}_${PACKAGE_VERSION}_${PACKAGE_ARCH}.ipk"
-ar r $OUTPUT_FILE debian-binary control.tar.gz data.tar.gz
+# outer tar (uncompressed), then gzip
+outer_buf = io.BytesIO()
+with tarfile.open(fileobj=outer_buf, mode='w:', format=tarfile.USTAR_FORMAT) as t:
+    t.addfile(*file_entry("./debian-binary",  b"2.0\n",              0o644))
+    t.addfile(*file_entry("./data.tar.gz",    data_buf.getvalue(),   0o644))
+    t.addfile(*file_entry("./control.tar.gz", ctrl_buf.getvalue(),   0o644))
 
-# Copy to source dir and cleanup
-cp $OUTPUT_FILE "${SOURCE_DIR}/"
-cd "${SOURCE_DIR}"
-rm -rf $BUILD_DIR
+with gzip.GzipFile(OUTPUT, 'wb', mtime=0) as gz:
+    gz.write(outer_buf.getvalue())
 
-echo "OK: $OUTPUT_FILE"
-ls -lh "$OUTPUT_FILE"
+size = os.path.getsize(OUTPUT)
+print(f"OK: {os.path.basename(OUTPUT)}  ({size} bytes)")
