@@ -1,4 +1,4 @@
-m = Map("rdp_controller", translate("RDP端口转发控制器"),
+m = Map("rdp_controller", translate("端口控制"),
     translate("控制OpenWrt端口转发的开启/关闭和倒计时管理"))
 
 -- 主设置section
