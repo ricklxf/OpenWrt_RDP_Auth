@@ -9,14 +9,14 @@ OpenWrt IPK format: gzip-compressed tar containing
 
 import tarfile, io, os, sys, gzip
 
-PACKAGE_NAME = "rdp-controller"
+PACKAGE_NAME = "Port-Control"
 PACKAGE_ARCH = "all"
 
 SOURCE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 with open(os.path.join(SOURCE_DIR, "VERSION")) as _f:
     PACKAGE_VERSION = _f.read().strip()
-OUTPUT     = os.path.join(SOURCE_DIR, f"{PACKAGE_NAME}_{PACKAGE_VERSION}_{PACKAGE_ARCH}.ipk")
+OUTPUT = os.path.join(SOURCE_DIR, f"{PACKAGE_NAME}_{PACKAGE_VERSION}.ipk")
 
 def read(path):
     with open(path, 'rb') as f:
