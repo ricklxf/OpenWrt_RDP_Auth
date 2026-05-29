@@ -5,12 +5,28 @@ import json
 import time
 import os
 import sys
+import logging
 from datetime import datetime
 import threading
 import hashlib
 import socket
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
+
+# ── 日志 ────────────────────────────────────────────────────────────────────
+LOG_FILE = '/var/log/rdp_controller.log'
+_fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S')
+logger = logging.getLogger('rdp_controller')
+logger.setLevel(logging.INFO)
+try:
+    _fh = logging.FileHandler(LOG_FILE)
+    _fh.setFormatter(_fmt)
+    logger.addHandler(_fh)
+except OSError:
+    pass
+_sh = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+logger.addHandler(_sh)
 
 CONFIG_PATH = '/etc/config/rdp_controller'
 FIREWALL_CONFIG = '/etc/config/firewall'
@@ -93,9 +109,14 @@ def send_feishu_webhook(message):
         )
         
         with urllib.request.urlopen(req, timeout=5) as response:
-            return response.status == 200
+            ok = response.status == 200
+            if ok:
+                logger.info("Webhook sent ok")
+            else:
+                logger.warning("Webhook returned status %d", response.status)
+            return ok
     except Exception as e:
-        print(f"Webhook发送失败: {e}")
+        logger.error("Webhook failed: %s", e)
         return False
 
 def save_timer_state():
@@ -128,8 +149,9 @@ def timer_thread():
                 if now >= end_time:
                     redirect_index = timer_info.get('index')
                     if redirect_index:
+                        logger.info("Timer expired: '%s' (index=%s), disabling", redirect_name, redirect_index)
                         toggle_redirect_enabled(redirect_index, False)
-                        
+
                         closed_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                         send_feishu_webhook(f"""🔒 端口转发已关闭
 ━━━━━━━━━━━━━━━
@@ -644,20 +666,21 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(b'Not Found')
     
     def log_message(self, format, *args):
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {format % args}")
+        logger.info("[%s] %s", self.address_string(), format % args)
 
 def main():
     port = int(uci_get('rdp_controller', 'main', 'port', '8080'))
-    
+    logger.info("=== rdp_controller starting on 0.0.0.0:%d ===", port)
+
     threading.Thread(target=timer_thread, daemon=True).start()
-    
+
     server = HTTPServer(('0.0.0.0', port), RequestHandler)
-    print(f"服务器启动在端口 {port}")
-    
+    logger.info("Server ready, log: %s", LOG_FILE)
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("服务器停止")
+        logger.info("Server stopping")
         server.shutdown()
 
 if __name__ == '__main__':

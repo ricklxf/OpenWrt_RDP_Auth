@@ -1,113 +1,166 @@
-m = Map("rdp_controller", translate("端口控制"),
-    translate("控制OpenWrt端口转发的开启/关闭和倒计时管理"))
+local luci_sys = require "luci.sys"
+local uci = require("luci.model.uci").cursor()
 
--- 主设置section
+-- 获取 LAN IP
+local function get_lan_ip()
+    local ip = luci_sys.exec("uci get network.lan.ipaddr 2>/dev/null"):gsub("[%s\n]+", "")
+    if ip == "" then
+        ip = luci_sys.exec(
+            "ip -4 addr show br-lan 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | head -1"
+        ):gsub("[%s\n]+", "")
+    end
+    return (ip ~= "" and ip) or "192.168.1.1"
+end
+
+-- 获取后台完整地址
+local function get_admin_url()
+    local port = uci:get("rdp_controller", "main", "port") or "8080"
+    return "http://" .. get_lan_ip() .. ":" .. port
+end
+
+-- 判断服务是否在运行
+local function is_running()
+    return luci_sys.call("/etc/init.d/rdp_controller status >/dev/null 2>&1") == 0
+end
+
+-- ─────────────────────────────────────────────────────────────────────────────
+m = Map("rdp_controller", translate("端口控制"),
+    translate("管理端口转发规则与倒计时"))
+
+-- ══════════════════════════════════════════
+-- 服务状态
+-- ══════════════════════════════════════════
+s0 = m:section(NamedSection, "main", "rdp_controller", translate("服务状态"))
+s0.addremove = false
+s0.anonymous = true
+
+-- 运行状态
+local sv = s0:option(DummyValue, "_svc_status", translate("运行状态"))
+sv.rawhtml = true
+function sv.cfgvalue(self, section)
+    if is_running() then
+        return "<b style='color:#4CAF50'>● 运行中</b>"
+    else
+        return "<b style='color:#f44336'>● 已停止</b>"
+    end
+end
+
+-- 管理地址（可点击链接）
+local lv = s0:option(DummyValue, "_svc_url", translate("管理地址"))
+lv.rawhtml = true
+function lv.cfgvalue(self, section)
+    local url = get_admin_url()
+    return string.format(
+        "<a href='%s' target='_blank' style='color:#1976D2;font-weight:bold'>%s &#x2197;</a>",
+        url, url
+    )
+end
+
+-- 端口转发列表（当前所有规则及状态）
+local pv = s0:option(DummyValue, "_fw_ports", translate("端口转发规则"))
+pv.rawhtml = true
+function pv.cfgvalue(self, section)
+    local out = {}
+    uci:foreach("firewall", "redirect", function(r)
+        if r.name then
+            local en   = (r.enabled ~= "0")
+            local col  = en and "#4CAF50" or "#9E9E9E"
+            local sym  = en and "✓" or "○"
+            local port = r.src_dport and (":" .. r.src_dport) or ""
+            table.insert(out, string.format(
+                "<span style='color:%s;margin-right:14px'>%s %s%s</span>",
+                col, sym, r.name, port
+            ))
+        end
+    end)
+    if #out == 0 then
+        return "<span style='color:#9E9E9E'>" .. translate("（暂无端口转发规则）") .. "</span>"
+    end
+    return table.concat(out, "")
+end
+
+-- 重启服务按钮
+local rb = s0:option(Button, "_restart_btn", translate("&nbsp;"))
+rb.inputtitle = translate("↺ 重启服务")
+rb.inputstyle = "apply"
+function rb.write(self, section)
+    luci_sys.call("/etc/init.d/rdp_controller restart >/dev/null 2>&1")
+    luci_sys.call("sleep 2")
+end
+
+-- ══════════════════════════════════════════
+-- 服务设置
+-- ══════════════════════════════════════════
 s = m:section(NamedSection, "main", "rdp_controller", translate("服务设置"))
 s.addremove = false
 s.anonymous = true
 
-e = s:option(Flag, "enabled", translate("启用插件"))
+local e = s:option(Flag, "enabled", translate("启用插件"))
 e.rmempty = false
 
-p = s:option(Value, "port", translate("访问端口"))
-p.datatype = "port"
-p.default = "8080"
-p.rmempty = false
+local po = s:option(Value, "port", translate("访问端口"))
+po.datatype = "port"
+po.default = "8080"
+po.rmempty = false
 
--- 密码设置
-a = s:option(Flag, "auth_enabled", translate("启用密码登录"))
-a.rmempty = false
+local ae = s:option(Flag, "auth_enabled", translate("启用密码登录"))
+ae.rmempty = false
 
-pwd = s:option(Value, "password", translate("访问密码"))
-pwd.password = true
-pwd:depends("auth_enabled", "1")
-pwd.rmempty = true
+local pw = s:option(Value, "password", translate("访问密码"))
+pw.password = true
+pw:depends("auth_enabled", "1")
+pw.rmempty = true
 
--- 端口转发选择
-rs = s:option(DynamicList, "controlled_redirects", translate("可控制的端口转发"))
+-- 可控制的端口转发（复选框多选）
+local rs = s:option(MultiValue, "controlled_redirects", translate("可控制的端口转发"))
 rs:depends("enabled", "1")
-rs.description = translate("选择哪些端口转发可以在Web界面中控制")
-
--- 读取防火墙配置中的redirect名称
-local uci = require "luci.model.uci".cursor()
-local redirect_names = {}
-uci:foreach("firewall", "redirect", function(s)
-    if s.name then
-        table.insert(redirect_names, s.name)
-        rs:value(s.name)
+rs.widget = "checkbox"
+uci:foreach("firewall", "redirect", function(r)
+    if r.name then
+        local label = r.name
+        if r.src_dport then
+            label = label .. "  (:" .. r.src_dport .. ")"
+        end
+        rs:value(r.name, label)
     end
 end)
 
--- Webhook设置
+-- ══════════════════════════════════════════
+-- 飞书通知
+-- ══════════════════════════════════════════
 w = m:section(NamedSection, "webhook", "webhook", translate("飞书通知"))
 w.addremove = false
 w.anonymous = true
 
-we = w:option(Flag, "enabled", translate("启用飞书通知"))
+local we = w:option(Flag, "enabled", translate("启用飞书通知"))
 we.rmempty = false
 
-wu = w:option(Value, "url", translate("Webhook地址"))
+local wu = w:option(Value, "url", translate("Webhook 地址"))
 wu:depends("enabled", "1")
 wu.rmempty = true
-wu.description = translate("飞书自定义机器人的Webhook地址")
+wu.placeholder = "https://open.feishu.cn/open-apis/bot/v2/hook/..."
 
--- 测试按钮
-testbtn = w:option(Button, "test_webhook", translate("发送测试通知"))
-testbtn:depends("enabled", "1")
-testbtn.inputtitle = translate("发送测试通知")
-testbtn.inputstyle = "apply"
-function testbtn.write(self, section)
-    -- 使用一个简单的Python脚本来调用Webhook测试API
-    luci.sys.call([[
-python3 -c "
-import requests
-import json
-from datetime import datetime
-
-# 读取UCI配置
-import subprocess
-def uci_get(config, section, option):
-    try:
-        result = subprocess.check_output(
-            ['uci', 'get', f'{config}.{section}.{option}'],
-            stderr=subprocess.STDOUT
-        ).decode('utf-8').strip()
-        return result
-    except:
-        return ''
-
-webhook_url = uci_get('rdp_controller', 'webhook', 'url')
-test_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-
-if webhook_url:
-    try:
-        payload = {
-            'msg_type': 'text',
-            'content': {'text': f'🔔 测试消息: {test_time}'}
-        }
-        response = requests.post(webhook_url, json=payload, timeout=5)
-        if response.status_code == 200:
-            print('测试消息发送成功')
-        else:
-            print(f'发送失败: {response.text}')
-    except Exception as e:
-        print(f'请求异常: {str(e)}')
-else:
-    print('未配置Webhook地址')
-" 2>&1 | logger -t rdp_controller_test &]])
-    
-    -- 通知用户
-    luci.sys.call("logger -t rdp_controller '测试通知已发送，请检查飞书或系统日志'")
+local wt = w:option(Button, "_test_wh", translate("&nbsp;"))
+wt.inputtitle = translate("发送测试通知")
+wt.inputstyle = "reload"
+wt:depends("enabled", "1")
+function wt.write(self, section)
+    local port = uci:get("rdp_controller", "main", "port") or "8080"
+    luci_sys.call(string.format(
+        "wget -q -O /tmp/.rdp_wh_test 'http://127.0.0.1:%s/api/webhook/test' 2>/dev/null",
+        port
+    ))
 end
 
+-- ══════════════════════════════════════════
 -- 其他设置
+-- ══════════════════════════════════════════
 s2 = m:section(NamedSection, "settings", "settings", translate("其他设置"))
 s2.addremove = false
 s2.anonymous = true
 
-p2 = s2:option(Flag, "persist_on_restart", translate("倒计时持久化"))
-p2.default = "1"
-p2.rmempty = false
-p2.description = translate("OpenWrt重启后保持倒计时状态")
+local pr = s2:option(Flag, "persist_on_restart", translate("重启后保持倒计时"))
+pr.default = "1"
+pr.rmempty = false
 
 return m
