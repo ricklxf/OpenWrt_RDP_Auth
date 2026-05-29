@@ -47,6 +47,8 @@ Section: net
 Priority: optional
 Maintainer: ricklxf90@gmail.com
 Depends: python3, luci
+Replaces: rdp_controller
+Conflicts: rdp_controller
 Description: RDP Port Forwarding Controller with countdown timer and Feishu notifications
 """.encode()
 
