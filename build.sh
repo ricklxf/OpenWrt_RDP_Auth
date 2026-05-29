@@ -7,7 +7,7 @@ OpenWrt IPK format: gzip-compressed tar containing
   ./debian-binary, ./data.tar.gz, ./control.tar.gz
 """
 
-import tarfile, io, os, sys, struct
+import tarfile, io, os, sys, gzip
 
 PACKAGE_NAME = "rdp-controller"
 PACKAGE_ARCH = "all"
@@ -98,30 +98,16 @@ with tarfile.open(fileobj=data_buf, mode='w:gz', format=tarfile.USTAR_FORMAT) as
     t.addfile(*file_entry("./etc/init.d/rdp_controller",
         read(f"{SOURCE_DIR}/files/rdp_controller.init"), 0o755))
 
-# AR archive (opkg/deb format): !<arch>\n + per-file 60-byte headers
-def ar_entry(name, data):
-    hdr = (
-        name.ljust(16)[:16] +   # filename  (16)
-        "0           " +         # timestamp (12)
-        "0     " +               # uid       (6)
-        "0     " +               # gid       (6)
-        "100644  " +             # mode      (8)
-        str(len(data)).ljust(10) +  # size   (10)
-        "`\n"                    # magic     (2)
-    )                            # total     60
-    assert len(hdr) == 60
-    entry = hdr.encode('ascii') + data
-    if len(data) % 2:           # AR requires even-byte alignment
-        entry += b'\n'
-    return entry
+# Outer: gzip-compressed tar — the real OpenWrt IPK format
+# (verified against official OpenWrt 23.05 packages)
+outer_buf = io.BytesIO()
+with tarfile.open(fileobj=outer_buf, mode='w:', format=tarfile.USTAR_FORMAT) as t:
+    t.addfile(*file_entry("./debian-binary",  b"2.0\n",            0o644))
+    t.addfile(*file_entry("./data.tar.gz",    data_buf.getvalue(), 0o644))
+    t.addfile(*file_entry("./control.tar.gz", ctrl_buf.getvalue(), 0o644))
 
-ipk = b"!<arch>\n"
-ipk += ar_entry("debian-binary",  b"2.0\n")
-ipk += ar_entry("control.tar.gz", ctrl_buf.getvalue())
-ipk += ar_entry("data.tar.gz",    data_buf.getvalue())
-
-with open(OUTPUT, 'wb') as f:
-    f.write(ipk)
+with gzip.GzipFile(OUTPUT, 'wb', compresslevel=9, mtime=0) as gz:
+    gz.write(outer_buf.getvalue())
 
 size = os.path.getsize(OUTPUT)
 print(f"OK: {os.path.basename(OUTPUT)}  ({size} bytes)")
