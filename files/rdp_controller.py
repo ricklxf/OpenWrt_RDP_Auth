@@ -79,8 +79,34 @@ def get_all_redirects():
     return redirects
 
 def get_controllable_redirects():
-    config = uci_get('rdp_controller', 'main', 'controlled_redirects', '').split()
-    return config
+    """读取被勾选的可控端口转发名称。
+
+    直接解析 /etc/config/rdp_controller，兼容两种存储形式：
+      list controlled_redirects 'RDP Forward'   ← UCI list，每项一行，空格安全
+      option controlled_redirects 'a b c'        ← 旧的空格分隔字符串
+    """
+    names = []
+    in_main = False
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                s = line.strip()
+                if s.startswith('config '):
+                    in_main = s.endswith("'main'") or s.endswith('"main"') or s.endswith(' main')
+                    continue
+                if not in_main:
+                    continue
+                if s.startswith('list controlled_redirects'):
+                    val = s.split(None, 2)[2].strip().strip('\'"')
+                    if val:
+                        names.append(val)
+                elif s.startswith('option controlled_redirects'):
+                    val = s.split(None, 2)[2].strip().strip('\'"')
+                    names = val.split()
+    except OSError as e:
+        logger.error("读取配置失败: %s", e)
+    logger.info("controlled_redirects = %r", names)
+    return names
 
 def toggle_redirect_enabled(index, enabled):
     state = '1' if enabled else '0'
@@ -501,7 +527,9 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path == '/api/redirects':
             all_redirects = get_all_redirects()
             controlled_names = get_controllable_redirects()
-            
+            logger.info("防火墙规则名: %r / 受控名: %r",
+                        [r.get('name') for r in all_redirects], controlled_names)
+
             result = []
             for r in all_redirects:
                 name = r.get('name', '未命名')

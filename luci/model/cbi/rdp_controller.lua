@@ -1,6 +1,8 @@
 local luci_sys = require "luci.sys"
 local uci = require("luci.model.uci").cursor()
 
+local STATUS_FILE = "/tmp/rdp_status.cache"
+
 -- 获取 LAN IP
 local function get_lan_ip()
     local ip = luci_sys.exec("uci get network.lan.ipaddr 2>/dev/null"):gsub("[%s\n]+", "")
@@ -12,20 +14,48 @@ local function get_lan_ip()
     return (ip ~= "" and ip) or "192.168.1.1"
 end
 
--- 获取后台完整地址
+-- 后台完整地址
 local function get_admin_url()
     local port = uci:get("rdp_controller", "main", "port") or "8080"
     return "http://" .. get_lan_ip() .. ":" .. port
 end
 
--- 判断服务是否在运行
-local function is_running()
-    return luci_sys.call("/etc/init.d/rdp_controller status >/dev/null 2>&1") == 0
+-- 服务是否运行（用 pgrep，比 status 可靠）
+local function svc_running()
+    return luci_sys.call("pgrep -f /usr/bin/rdp_controller.py >/dev/null 2>&1") == 0
+end
+
+-- 刷新状态到缓存文件（只在按钮点击/保存时调用）
+local function refresh_status()
+    local running = svc_running()
+    local t = os.date("%Y-%m-%d %H:%M:%S")
+    local f = io.open(STATUS_FILE, "w")
+    if f then
+        f:write(running and "1\n" or "0\n")
+        f:write(t .. "\n")
+        f:close()
+    end
+end
+
+-- 读取缓存状态，返回 running(bool 或 nil), 检测时间
+local function read_status()
+    local f = io.open(STATUS_FILE, "r")
+    if not f then return nil, nil end
+    local running = f:read("*l")
+    local t = f:read("*l")
+    f:close()
+    return (running == "1"), t
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
 m = Map("rdp_controller", translate("端口控制"),
     translate("管理端口转发规则与倒计时"))
+
+-- 保存并应用后，刷新服务状态
+function m.on_commit(self)
+    luci_sys.call("sleep 2")
+    refresh_status()
+end
 
 -- ══════════════════════════════════════════
 -- 服务状态
@@ -34,15 +64,18 @@ s0 = m:section(NamedSection, "main", "rdp_controller", translate("服务状态")
 s0.addremove = false
 s0.anonymous = true
 
--- 运行状态
+-- 运行状态（只读缓存，不自动检测）
 local sv = s0:option(DummyValue, "_svc_status", translate("运行状态"))
 sv.rawhtml = true
 function sv.cfgvalue(self, section)
-    if is_running() then
-        return "<b style='color:#4CAF50'>● 运行中</b>"
-    else
-        return "<b style='color:#f44336'>● 已停止</b>"
+    local running, t = read_status()
+    if running == nil then
+        return "<span style='color:#9E9E9E'>● 未检测 —— 请点击下方「状态检测」</span>"
     end
+    local badge = running
+        and "<b style='color:#4CAF50'>● 运行中</b>"
+        or  "<b style='color:#f44336'>● 已停止</b>"
+    return badge .. "  <span style='color:#999'>(检测于 " .. (t or "") .. ")</span>"
 end
 
 -- 管理地址（可点击链接）
@@ -56,7 +89,7 @@ function lv.cfgvalue(self, section)
     )
 end
 
--- 端口转发列表（当前所有规则及状态）
+-- 端口转发规则列表
 local pv = s0:option(DummyValue, "_fw_ports", translate("端口转发规则"))
 pv.rawhtml = true
 function pv.cfgvalue(self, section)
@@ -79,6 +112,14 @@ function pv.cfgvalue(self, section)
     return table.concat(out, "")
 end
 
+-- 状态检测按钮
+local cb = s0:option(Button, "_check_btn", translate("&nbsp;"))
+cb.inputtitle = translate("🔍 状态检测")
+cb.inputstyle = "reload"
+function cb.write(self, section)
+    refresh_status()
+end
+
 -- 重启服务按钮
 local rb = s0:option(Button, "_restart_btn", translate("&nbsp;"))
 rb.inputtitle = translate("↺ 重启服务")
@@ -86,6 +127,7 @@ rb.inputstyle = "apply"
 function rb.write(self, section)
     luci_sys.call("/etc/init.d/rdp_controller restart >/dev/null 2>&1")
     luci_sys.call("sleep 2")
+    refresh_status()
 end
 
 -- ══════════════════════════════════════════
@@ -111,10 +153,11 @@ pw.password = true
 pw:depends("auth_enabled", "1")
 pw.rmempty = true
 
--- 可控制的端口转发（复选框多选）
+-- 可控制的端口转发（复选框多选，存为 UCI list，空格安全）
 local rs = s:option(MultiValue, "controlled_redirects", translate("可控制的端口转发"))
 rs:depends("enabled", "1")
 rs.widget = "checkbox"
+rs.rmempty = true
 uci:foreach("firewall", "redirect", function(r)
     if r.name then
         local label = r.name
@@ -124,6 +167,19 @@ uci:foreach("firewall", "redirect", function(r)
         rs:value(r.name, label)
     end
 end)
+-- 存为 UCI list（每项独立一行），读时拼回字符串供复选框渲染
+function rs.cfgvalue(self, section)
+    local v = self.map:get(section, "controlled_redirects")
+    if type(v) == "table" then return table.concat(v, " ") end
+    return v
+end
+function rs.write(self, section, value)
+    local t = (type(value) == "table") and value or { value }
+    self.map:set(section, "controlled_redirects", t)
+end
+function rs.remove(self, section)
+    self.map:del(section, "controlled_redirects")
+end
 
 -- ══════════════════════════════════════════
 -- 飞书通知
