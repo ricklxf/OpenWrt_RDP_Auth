@@ -5,6 +5,7 @@ import json
 import time
 import os
 import sys
+import shutil
 import logging
 from datetime import datetime
 import threading
@@ -122,12 +123,52 @@ def get_controllable_redirects():
     logger.info("controlled_redirects = %r", names)
     return names
 
+def get_redirect_by_secid(secid):
+    for r in get_all_redirects():
+        if r.get('index') == secid:
+            return r
+    return None
+
+def cut_connections(redirect):
+    """删除流经该端口转发的已建立连接（conntrack 表项），强制断开现有会话。
+
+    仅禁用防火墙 redirect 只能阻止新连接；已建立的 RDP 等长连接因 conntrack
+    中仍有 DNAT 映射会继续保持，必须删除对应 conntrack 表项才能断开。
+    """
+    if not shutil.which('conntrack'):
+        logger.warning("未检测到 conntrack 命令，无法断开已建立连接。"
+                       "请执行: opkg update && opkg install conntrack-tools")
+        return
+
+    proto_raw = (redirect.get('proto') or 'tcp').lower()
+    protos = [p for p in ('tcp', 'udp') if p in proto_raw] or ['tcp']
+    src_dport = redirect.get('src_dport')
+    dest_ip = redirect.get('dest_ip')
+    dest_port = redirect.get('dest_port')
+
+    for p in protos:
+        # 删除进入该转发端口（DNAT 前的目的端口）的连接
+        if src_dport:
+            subprocess.run(['conntrack', '-D', '-p', p, '--orig-port-dst', str(src_dport)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 删除指向内部目标（DNAT 后）的连接，覆盖回复方向
+        if dest_ip and dest_port:
+            subprocess.run(['conntrack', '-D', '-p', p, '-d', str(dest_ip), '--dport', str(dest_port)],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    logger.info("已清除 conntrack 连接: proto=%s src_dport=%s dest=%s:%s",
+                protos, src_dport, dest_ip, dest_port)
+
 def toggle_redirect_enabled(secid, enabled):
     state = '1' if enabled else '0'
     subprocess.run(['uci', 'set', f'firewall.{secid}.enabled={state}'], check=False)
     subprocess.run(['uci', 'commit', 'firewall'], check=False)
     subprocess.run(['/etc/init.d/firewall', 'reload'], check=False)
     logger.info("redirect %s -> enabled=%s", secid, state)
+    # 关闭时同时断开已建立的连接
+    if not enabled:
+        redirect = get_redirect_by_secid(secid)
+        if redirect:
+            cut_connections(redirect)
 
 def build_redirects_payload():
     """构造 /api/redirects 响应：受控的端口转发 + 当前计时器。"""
