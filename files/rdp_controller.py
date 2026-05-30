@@ -181,12 +181,17 @@ def send_feishu_webhook(message):
         logger.error("Webhook failed: %s", e)
         return False
 
-def save_timer_state():
-    persist = uci_get('rdp_controller', 'main', 'persist_on_restart', '1') == '1'
-    if persist:
-        with timer_lock:
-            with open(TIMER_STATE_FILE, 'w') as f:
-                json.dump(active_timers, f)
+def save_timer_state(snapshot):
+    """把计时器快照写入磁盘。snapshot 由调用方在锁内复制好，
+    本函数不再获取 timer_lock —— 之前在持锁上下文里再次抢锁会死锁。"""
+    persist = uci_get('rdp_controller', 'settings', 'persist_on_restart', '1') == '1'
+    if not persist:
+        return
+    try:
+        with open(TIMER_STATE_FILE, 'w') as f:
+            json.dump(snapshot, f)
+    except OSError as e:
+        logger.error("保存计时器状态失败: %s", e)
 
 def load_timer_state():
     if os.path.exists(TIMER_STATE_FILE):
@@ -203,32 +208,30 @@ def timer_thread():
     
     while True:
         now = time.time()
-        to_remove = []
-        
+        expired = []
+
+        # 锁内：只做到期判断、移除、快照（全是快速内存操作）
         with timer_lock:
             for redirect_name, timer_info in list(active_timers.items()):
-                end_time = timer_info.get('end_time', 0)
-                if now >= end_time:
-                    redirect_index = timer_info.get('index')
-                    if redirect_index:
-                        logger.info("Timer expired: '%s' (index=%s), disabling", redirect_name, redirect_index)
-                        toggle_redirect_enabled(redirect_index, False)
+                if now >= timer_info.get('end_time', 0):
+                    expired.append((redirect_name, timer_info.get('index')))
+                    del active_timers[redirect_name]
+            snapshot = {k: v.copy() for k, v in active_timers.items()}
 
-                        closed_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                        send_feishu_webhook(f"""🔒 端口转发已关闭
+        # 锁外：执行慢操作（firewall reload、webhook、写文件），避免阻塞 /api/redirects
+        if expired:
+            save_timer_state(snapshot)
+            for redirect_name, redirect_index in expired:
+                if redirect_index:
+                    logger.info("计时器到期: '%s' (index=%s)，关闭端口", redirect_name, redirect_index)
+                    toggle_redirect_enabled(redirect_index, False)
+                    closed_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    send_feishu_webhook(f"""🔒 端口转发已关闭
 ━━━━━━━━━━━━━━━
 📋 名称: {redirect_name}
 🕐 关闭时间: {closed_time}
 ━━━━━━━━━━━━━━━""")
-                    
-                    to_remove.append(redirect_name)
-            
-            for name in to_remove:
-                del active_timers[name]
-            
-            if to_remove:
-                save_timer_state()
-        
+
         time.sleep(1)
 
 def login_page():
@@ -411,7 +414,7 @@ def main_page():
                     const nm = encodeURIComponent(r.name);
                     let mid;
                     if (hasTimer) {
-                        mid = `<div class="countdown-wrapper">
+                        mid = `<div class="countdown-wrapper" style="display:flex;flex-direction:column;">
                                  <div class="countdown-track"><div class="countdown-fill" id="fill-${nm}"></div></div>
                                  <div class="countdown-time" id="time-${nm}"></div>
                                </div>`;
@@ -437,9 +440,11 @@ def main_page():
             tick();
         }
 
-        // 刷新所有倒计时显示；到点的本地移除并向服务器同步
+        // 仅刷新倒计时显示。到点后只触发一次同步（_synced 去重），
+        // 不在此处递归 render/删除，避免轮询风暴导致页面卡死。
         function tick() {
             const now = Date.now();
+            let needSync = false;
             for (const name of Object.keys(state.timers)) {
                 const t = state.timers[name];
                 const nm = encodeURIComponent(name);
@@ -447,18 +452,18 @@ def main_page():
                 const time = document.getElementById('time-' + nm);
                 const total = t.end_time * 1000 - t.start_time * 1000;
                 const remaining = Math.max(0, t.end_time * 1000 - now);
-                const percent = total > 0 ? (remaining / total) * 100 : 0;
                 if (fill && time) {
+                    const percent = total > 0 ? (remaining / total) * 100 : 0;
                     fill.style.width = percent + '%';
                     fill.style.background = getColorClass(percent);
                     time.textContent = formatTime(remaining);
                 }
-                if (remaining <= 0) {
-                    delete state.timers[name];
-                    render(true);
-                    loadRedirects();
+                if (remaining <= 0 && !t._synced) {
+                    t._synced = true;       // 仅同步一次，等服务器确认关闭后移除
+                    needSync = true;
                 }
             }
+            if (needSync) loadRedirects();
         }
         function ensureTicking() {
             if (!ticking) ticking = setInterval(tick, 1000);
@@ -619,8 +624,9 @@ class RequestHandler(BaseHTTPRequestHandler):
                         'start_time': now,
                         'end_time': end_time
                     }
-                    save_timer_state()
-                
+                    snapshot = {k: v.copy() for k, v in active_timers.items()}
+                save_timer_state(snapshot)
+
                 toggle_redirect_enabled(index, True)
                 
                 start_time_str = datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')
@@ -664,10 +670,11 @@ class RequestHandler(BaseHTTPRequestHandler):
                     return
                 
                 with timer_lock:
-                    if name in active_timers:
-                        del active_timers[name]
-                        save_timer_state()
-                
+                    active_timers.pop(name, None)
+                    snapshot = {k: v.copy() for k, v in active_timers.items()}
+                save_timer_state(snapshot)
+
+                # 立刻结束：同时关闭该端口转发
                 toggle_redirect_enabled(index, False)
                 
                 closed_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
