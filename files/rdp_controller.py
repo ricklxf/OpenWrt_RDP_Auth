@@ -129,6 +129,27 @@ def toggle_redirect_enabled(secid, enabled):
     subprocess.run(['/etc/init.d/firewall', 'reload'], check=False)
     logger.info("redirect %s -> enabled=%s", secid, state)
 
+def build_redirects_payload():
+    """构造 /api/redirects 响应：受控的端口转发 + 当前计时器。"""
+    all_redirects = get_all_redirects()
+    controlled = get_controllable_redirects()
+    result = []
+    for r in all_redirects:
+        name = r.get('name')
+        if name and name in controlled:
+            # 防火墙 redirect 缺省即启用，只有显式 enabled='0' 才算关闭
+            enabled = '0' if r.get('enabled') == '0' else '1'
+            result.append({
+                'name': name,
+                'index': r.get('index'),
+                'enabled': enabled,
+            })
+    with timer_lock:
+        timers_copy = {k: v.copy() for k, v in active_timers.items()}
+    logger.info("payload redirects=%r controlled=%r timers=%r",
+                [x['name'] for x in result], controlled, list(timers_copy.keys()))
+    return {'redirects': result, 'timers': timers_copy}
+
 def send_feishu_webhook(message):
     webhook_enabled = uci_get('rdp_controller', 'webhook', 'enabled', '0') == '1'
     webhook_url = uci_get('rdp_controller', 'webhook', 'url', '')
@@ -337,175 +358,159 @@ def main_page():
     </div>
     
     <script>
+        let state = { redirects: [], timers: {} };
+        let lastSig = '';
+        let ticking = null;
+
         function formatTime(ms) {
-            const seconds = Math.floor(ms / 1000);
-            const mins = Math.floor(seconds / 60);
-            const secs = seconds % 60;
-            return mins.toString().padStart(2, '0') + ':' + secs.toString().padStart(2, '0');
+            const s = Math.floor(ms / 1000);
+            const m = Math.floor(s / 60);
+            return m.toString().padStart(2, '0') + ':' + (s % 60).toString().padStart(2, '0');
         }
-        
-        function getColorClass(percent) {
-            if (percent > 50) return '#4CAF50';
-            if (percent > 20) return '#FFC107';
+        function getColorClass(p) {
+            if (p > 50) return '#4CAF50';
+            if (p > 20) return '#FFC107';
             return '#F44336';
         }
-        
+
         async function loadRedirects() {
             try {
-                const resp = await fetch('/api/redirects');
+                const resp = await fetch('/api/redirects', {cache: 'no-store'});
                 const data = await resp.json();
-                renderRedirects(data);
+                state.redirects = data.redirects || [];
+                state.timers = data.timers || {};
+                render(false);
             } catch (e) {
-                document.getElementById('redirect-list').innerHTML = '加载失败';
+                document.getElementById('redirect-list').innerHTML = '加载失败，请刷新页面';
             }
         }
-        
-        function renderRedirects(data) {
+
+        // 仅当结构（端口集合 / 是否有计时器 / 启用状态）变化时才重建 DOM，
+        // 否则只更新倒计时文本 —— 避免每 5 秒轮询清空用户正在输入的分钟数
+        function render(force) {
             const container = document.getElementById('redirect-list');
-            
-            if (data.redirects.length === 0) {
-                container.innerHTML = '<p>没有可控制的端口转发，请先在LuCI配置中选择。</p>';
+            if (state.redirects.length === 0) {
+                container.innerHTML = '<p>没有可控制的端口转发，请先在 LuCI「端口控制 → 服务设置」中勾选并保存。</p>';
+                lastSig = '';
                 return;
             }
-            
-            let html = '';
-            for (const r of data.redirects) {
-                const statusClass = r.enabled === '1' ? 'status-on' : 'status-off';
-                const hasTimer = data.timers[r.name] !== undefined;
-                let timerHtml = '';
-                
-                if (hasTimer) {
-                    const timer = data.timers[r.name];
-                    const now = Date.now();
-                    const total = timer.end_time * 1000 - timer.start_time * 1000;
-                    const remaining = Math.max(0, timer.end_time * 1000 - now);
-                    const percent = (remaining / total) * 100;
-                    
-                    timerHtml = `
-                        <div class="countdown-wrapper">
-                            <div class="countdown-track">
-                                <div class="countdown-fill" id="fill-${encodeURIComponent(r.name)}" 
-                                    style="width: ${percent}%; background: ${getColorClass(percent)};"></div>
-                            </div>
-                            <div class="countdown-time" id="time-${encodeURIComponent(r.name)}">${formatTime(remaining)}</div>
-                        </div>
-                    `;
-                } else {
-                    timerHtml = `
-                        <div class="countdown-wrapper">
-                            <span class="timer-label">倒计时</span>
-                            <input type="number" class="timer-input" id="minutes-${encodeURIComponent(r.name)}" min="1" value="30" placeholder="分钟">
-                        </div>
-                    `;
-                }
-                
-                html += `
-                    <div class="redirect-item">
-                        <span class="status-indicator ${statusClass}"></span>
-                        <div class="redirect-name">${r.name}</div>
-                        ${timerHtml}
-                        <div class="btn-group">
-                            <button class="btn btn-start" onclick="startTimer('${encodeURIComponent(r.name)}', '${r.index}')" 
-                                    ${hasTimer ? 'disabled' : ''}>
-                                倒计时开启
-                            </button>
-                            <button class="btn btn-stop" onclick="stopTimer('${encodeURIComponent(r.name)}', '${r.index}')" 
-                                    ${!hasTimer ? 'disabled' : ''}>
-                                立刻结束
-                            </button>
-                        </div>
-                    </div>
-                `;
-            }
-            
-            container.innerHTML = html;
-            
-            if (Object.keys(data.timers).length > 0) {
-                updateTimers(data.timers);
-            }
-        }
-        
-        let countdownTimer = null;
-        function updateTimers(timers) {
-            // 先清除上一个定时器，否则每次 loadRedirects 都会新建一个，
-            // 定时器不断累积最终导致页面卡死
-            if (countdownTimer) {
-                clearInterval(countdownTimer);
-                countdownTimer = null;
-            }
-            countdownTimer = setInterval(() => {
-                const now = Date.now();
-                let allExpired = true;
+            const now = Date.now();
+            const sig = state.redirects.map(r => {
+                const t = state.timers[r.name];
+                const live = t && (t.end_time * 1000 > now);
+                return r.name + '|' + r.index + '|' + (live ? 'T' : '_') + '|' + r.enabled;
+            }).join(';');
 
-                for (const [name, timer] of Object.entries(timers)) {
-                    const fillEl = document.getElementById(`fill-${encodeURIComponent(name)}`);
-                    const timeEl = document.getElementById(`time-${encodeURIComponent(name)}`);
-
-                    if (fillEl && timeEl) {
-                        const total = timer.end_time * 1000 - timer.start_time * 1000;
-                        const remaining = Math.max(0, timer.end_time * 1000 - now);
-                        const percent = (remaining / total) * 100;
-
-                        fillEl.style.width = percent + '%';
-                        fillEl.style.background = getColorClass(percent);
-                        timeEl.textContent = formatTime(remaining);
-
-                        if (remaining > 0) allExpired = false;
+            if (force || sig !== lastSig) {
+                lastSig = sig;
+                let html = '';
+                for (const r of state.redirects) {
+                    const t = state.timers[r.name];
+                    const hasTimer = t && (t.end_time * 1000 > now);
+                    const on = (r.enabled === '1') || hasTimer;
+                    const nm = encodeURIComponent(r.name);
+                    let mid;
+                    if (hasTimer) {
+                        mid = `<div class="countdown-wrapper">
+                                 <div class="countdown-track"><div class="countdown-fill" id="fill-${nm}"></div></div>
+                                 <div class="countdown-time" id="time-${nm}"></div>
+                               </div>`;
+                    } else {
+                        mid = `<div class="countdown-wrapper">
+                                 <span class="timer-label">倒计时</span>
+                                 <input type="number" class="timer-input" id="minutes-${nm}" min="1" value="30">
+                                 <span class="timer-label">分钟</span>
+                               </div>`;
                     }
+                    html += `<div class="redirect-item">
+                        <span class="status-indicator ${on ? 'status-on' : 'status-off'}"></span>
+                        <div class="redirect-name">${r.name}</div>
+                        ${mid}
+                        <div class="btn-group">
+                            <button class="btn btn-start" ${hasTimer ? 'disabled' : ''} onclick="startTimer('${nm}','${r.index}')">倒计时开启</button>
+                            <button class="btn btn-stop" ${hasTimer ? '' : 'disabled'} onclick="stopTimer('${nm}','${r.index}')">立刻结束</button>
+                        </div>
+                    </div>`;
                 }
+                container.innerHTML = html;
+            }
+            tick();
+        }
 
-                if (allExpired) {
-                    clearInterval(countdownTimer);
-                    countdownTimer = null;
+        // 刷新所有倒计时显示；到点的本地移除并向服务器同步
+        function tick() {
+            const now = Date.now();
+            for (const name of Object.keys(state.timers)) {
+                const t = state.timers[name];
+                const nm = encodeURIComponent(name);
+                const fill = document.getElementById('fill-' + nm);
+                const time = document.getElementById('time-' + nm);
+                const total = t.end_time * 1000 - t.start_time * 1000;
+                const remaining = Math.max(0, t.end_time * 1000 - now);
+                const percent = total > 0 ? (remaining / total) * 100 : 0;
+                if (fill && time) {
+                    fill.style.width = percent + '%';
+                    fill.style.background = getColorClass(percent);
+                    time.textContent = formatTime(remaining);
+                }
+                if (remaining <= 0) {
+                    delete state.timers[name];
+                    render(true);
                     loadRedirects();
                 }
-            }, 1000);
+            }
         }
-        
+        function ensureTicking() {
+            if (!ticking) ticking = setInterval(tick, 1000);
+        }
+
         async function startTimer(encodedName, index) {
             const name = decodeURIComponent(encodedName);
-            const minutes = parseInt(document.getElementById(`minutes-${encodedName}`).value) || 30;
-            
+            const input = document.getElementById('minutes-' + encodedName);
+            const minutes = (input && parseInt(input.value)) || 30;
+            // 乐观更新：立即本地显示倒计时，无需等待服务器
+            const now = Date.now() / 1000;
+            state.timers[name] = { index: index, start_time: now, end_time: now + minutes * 60 };
+            render(true);
             try {
                 const resp = await fetch('/api/timer/start', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name: name, index: index, minutes: minutes})
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name: name, index: index, minutes: minutes })
                 });
                 const data = await resp.json();
-                
                 if (data.success) {
-                    loadRedirects();
+                    loadRedirects();      // 用服务器真实时间校准
                 } else {
-                    alert('操作失败: ' + data.message);
+                    delete state.timers[name];
+                    render(true);
+                    alert('开启失败: ' + (data.message || '未知错误'));
                 }
             } catch (e) {
-                alert('请求失败');
+                delete state.timers[name];
+                render(true);
+                alert('请求失败: ' + e);
             }
         }
-        
+
         async function stopTimer(encodedName, index) {
             const name = decodeURIComponent(encodedName);
-            
+            delete state.timers[name];   // 乐观移除
+            render(true);
             try {
                 const resp = await fetch('/api/timer/stop', {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({name: name, index: index})
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ name: name, index: index })
                 });
                 const data = await resp.json();
-                
-                if (data.success) {
-                    loadRedirects();
-                } else {
-                    alert('操作失败: ' + data.message);
-                }
+                if (!data.success) alert('结束失败: ' + (data.message || ''));
             } catch (e) {
-                alert('请求失败');
+                alert('请求失败: ' + e);
             }
+            loadRedirects();
         }
-        
+
         loadRedirects();
+        ensureTicking();
         setInterval(loadRedirects, 5000);
     </script>
 </body>
@@ -548,28 +553,11 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(main_page().encode('utf-8'))
         
         elif path == '/api/redirects':
-            all_redirects = get_all_redirects()
-            controlled_names = get_controllable_redirects()
-            logger.info("防火墙规则名: %r / 受控名: %r",
-                        [r.get('name') for r in all_redirects], controlled_names)
-
-            result = []
-            for r in all_redirects:
-                name = r.get('name', '未命名')
-                if name in controlled_names:
-                    result.append({
-                        'name': name,
-                        'index': r.get('index'),
-                        'enabled': r.get('enabled', '0')
-                    })
-            
-            with timer_lock:
-                timers_copy = {k: v.copy() for k, v in active_timers.items()}
-            
+            payload = build_redirects_payload()
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            self.wfile.write(json.dumps({'redirects': result, 'timers': timers_copy}).encode('utf-8'))
+            self.wfile.write(json.dumps(payload).encode('utf-8'))
         
         else:
             self.send_response(404)
