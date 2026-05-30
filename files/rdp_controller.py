@@ -187,9 +187,30 @@ def build_redirects_payload():
             })
     with timer_lock:
         timers_copy = {k: v.copy() for k, v in active_timers.items()}
+    wol_mac = uci_get('rdp_controller', 'main', 'wol_mac', '')
     logger.info("payload redirects=%r controlled=%r timers=%r",
                 [x['name'] for x in result], controlled, list(timers_copy.keys()))
-    return {'redirects': result, 'timers': timers_copy}
+    return {'redirects': result, 'timers': timers_copy, 'wol_mac': wol_mac}
+
+def send_wol(mac):
+    """向指定 MAC 发送网络唤醒魔术包（UDP 广播到 9 端口）。"""
+    clean = mac.replace(':', '').replace('-', '').replace(' ', '').strip()
+    if len(clean) != 12 or not all(c in '0123456789abcdefABCDEF' for c in clean):
+        return False, 'MAC 地址格式错误'
+    try:
+        mac_bytes = bytes.fromhex(clean)
+        packet = b'\xff' * 6 + mac_bytes * 16
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # 同时发往全局广播与 9 端口，提升不同网络环境下的成功率
+        s.sendto(packet, ('255.255.255.255', 9))
+        s.sendto(packet, ('255.255.255.255', 7))
+        s.close()
+        logger.info("已发送网络唤醒魔术包: %s", mac)
+        return True, '已发送唤醒魔术包'
+    except Exception as e:
+        logger.error("网络唤醒失败: %s", e)
+        return False, str(e)
 
 def send_feishu_webhook(message):
     webhook_enabled = uci_get('rdp_controller', 'webhook', 'enabled', '0') == '1'
@@ -397,10 +418,14 @@ def main_page():
 </head>
 <body>
     <h1>端口转发控制器 <span style="font-size:14px;color:#999;">v__PKG_VERSION__</span></h1>
+    <div id="wol-bar" style="text-align:center;margin:10px 0;display:none;">
+        <button id="wol-btn" class="btn" style="background:#673AB7;padding:10px 22px;font-size:15px;" onclick="wakeHost()">🖥 唤醒主机</button>
+        <span id="wol-mac" style="margin-left:10px;color:#888;font-size:13px;"></span>
+    </div>
     <div class="container" id="redirect-list">
         加载中...
     </div>
-    
+
     <script>
         let state = { redirects: [], timers: {} };
         let lastSig = '';
@@ -423,10 +448,38 @@ def main_page():
                 const data = await resp.json();
                 state.redirects = data.redirects || [];
                 state.timers = data.timers || {};
+                updateWolBar(data.wol_mac || '');
                 render(false);
             } catch (e) {
                 document.getElementById('redirect-list').innerHTML = '加载失败，请刷新页面';
             }
+        }
+
+        // 仅在配置了 MAC 时显示唤醒按钮
+        function updateWolBar(mac) {
+            const bar = document.getElementById('wol-bar');
+            if (mac) {
+                document.getElementById('wol-mac').textContent = '目标: ' + mac;
+                bar.style.display = 'block';
+            } else {
+                bar.style.display = 'none';
+            }
+        }
+
+        async function wakeHost() {
+            const btn = document.getElementById('wol-btn');
+            btn.disabled = true;
+            const old = btn.textContent;
+            btn.textContent = '发送中...';
+            try {
+                const resp = await fetch('/api/wol', {method: 'POST'});
+                const data = await resp.json();
+                alert(data.success ? ('✅ ' + data.message) : ('❌ ' + data.message));
+            } catch (e) {
+                alert('请求失败: ' + e);
+            }
+            btn.textContent = old;
+            btn.disabled = false;
         }
 
         // 仅当结构（端口集合 / 是否有计时器 / 启用状态）变化时才重建 DOM，
@@ -604,13 +657,23 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps(payload).encode('utf-8'))
-        
+
+        elif path == '/api/webhook/test':
+            # LuCI 测试按钮用 wget(GET) 触发，这里也要受理
+            test_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            ok = send_feishu_webhook(f"🔔 Port-Control 测试通知: {test_time}")
+            msg = '测试消息已发送' if ok else '发送失败：请确认已勾选启用、填写正确的 Webhook 地址并已保存'
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': ok, 'message': msg}).encode('utf-8'))
+
         else:
             self.send_response(404)
             self.send_header('Content-type', 'text/plain')
             self.end_headers()
             self.wfile.write(b'Not Found')
-    
+
     def do_POST(self):
         parsed_path = urlparse(self.path)
         path = parsed_path.path
@@ -738,7 +801,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path == '/api/webhook/test':
             test_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             success = send_feishu_webhook(f"🔔 测试消息: {test_time}")
-            
+
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -746,7 +809,24 @@ class RequestHandler(BaseHTTPRequestHandler):
                 self.wfile.write(json.dumps({'success': True, 'message': '测试消息发送成功'}).encode('utf-8'))
             else:
                 self.wfile.write(json.dumps({'success': False, 'message': '测试消息发送失败，请检查配置'}).encode('utf-8'))
-        
+
+        elif path == '/api/wol':
+            if not self.check_auth():
+                self.send_response(401)
+                self.send_header('Content-type', 'application/json')
+                self.end_headers()
+                self.wfile.write(json.dumps({'success': False, 'message': '未授权'}).encode('utf-8'))
+                return
+            mac = uci_get('rdp_controller', 'main', 'wol_mac', '')
+            if not mac:
+                ok, message = False, '未配置唤醒 MAC 地址，请先在 LuCI 中填写'
+            else:
+                ok, message = send_wol(mac)
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'success': ok, 'message': message}).encode('utf-8'))
+
         else:
             self.send_response(404)
             self.send_header('Content-type', 'text/plain')

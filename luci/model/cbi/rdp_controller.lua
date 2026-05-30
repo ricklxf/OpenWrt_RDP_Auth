@@ -153,6 +153,12 @@ pw.password = true
 pw:depends("auth_enabled", "1")
 pw.rmempty = true
 
+-- 网络唤醒目标 MAC
+local wol = s:option(Value, "wol_mac", translate("网络唤醒 MAC 地址"))
+wol.placeholder = "AA:BB:CC:DD:EE:FF"
+wol.rmempty = true
+wol.description = translate("填写后，管理页面会出现「唤醒主机」按钮（发送 WoL 魔术包）")
+
 -- 可控制的端口转发（复选框多选，存为 UCI list，空格安全）
 local rs = s:option(MultiValue, "controlled_redirects", translate("可控制的端口转发"))
 rs:depends("enabled", "1")
