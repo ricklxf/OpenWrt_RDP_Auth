@@ -22,6 +22,10 @@ def read(path):
     with open(path, 'rb') as f:
         return f.read()
 
+def read_versioned(path):
+    """读取文件并把 __PKG_VERSION__ 占位符替换为当前版本号。"""
+    return read(path).replace(b'__PKG_VERSION__', PACKAGE_VERSION.encode())
+
 def file_entry(name, data, mode=0o644):
     ti = tarfile.TarInfo(name=name)
     ti.type = tarfile.REGTYPE
@@ -90,11 +94,11 @@ with tarfile.open(fileobj=data_buf, mode='w:gz', format=tarfile.USTAR_FORMAT) as
               "./etc", "./etc/config", "./etc/init.d"]:
         t.addfile(dir_entry(d))
     t.addfile(*file_entry("./usr/bin/rdp_controller.py",
-        read(f"{SOURCE_DIR}/files/rdp_controller.py"), 0o755))
+        read_versioned(f"{SOURCE_DIR}/files/rdp_controller.py"), 0o755))
     t.addfile(*file_entry("./usr/lib/lua/luci/controller/rdp_controller.lua",
         read(f"{SOURCE_DIR}/luci/controller/rdp_controller.lua"), 0o644))
     t.addfile(*file_entry("./usr/lib/lua/luci/model/cbi/rdp_controller.lua",
-        read(f"{SOURCE_DIR}/luci/model/cbi/rdp_controller.lua"), 0o644))
+        read_versioned(f"{SOURCE_DIR}/luci/model/cbi/rdp_controller.lua"), 0o644))
     t.addfile(*file_entry("./etc/config/rdp_controller",
         read(f"{SOURCE_DIR}/files/rdp_controller"), 0o644))
     t.addfile(*file_entry("./etc/init.d/rdp_controller",

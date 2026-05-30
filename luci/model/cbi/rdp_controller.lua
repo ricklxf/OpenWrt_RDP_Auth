@@ -48,7 +48,7 @@ local function read_status()
 end
 
 -- ─────────────────────────────────────────────────────────────────────────────
-m = Map("rdp_controller", translate("端口控制"),
+m = Map("rdp_controller", translate("端口控制") .. " v__PKG_VERSION__",
     translate("管理端口转发规则与倒计时"))
 
 -- 保存并应用后，刷新服务状态
@@ -167,18 +167,12 @@ uci:foreach("firewall", "redirect", function(r)
         rs:value(r.name, label)
     end
 end)
--- 存为 UCI list（每项独立一行），读时拼回字符串供复选框渲染
-function rs.cfgvalue(self, section)
-    local v = self.map:get(section, "controlled_redirects")
-    if type(v) == "table" then return table.concat(v, " ") end
-    return v
-end
+-- 强制以空格分隔的字符串存储（uci:set 只可靠接受字符串，传 table 会静默失败）
 function rs.write(self, section, value)
-    local t = (type(value) == "table") and value or { value }
-    self.map:set(section, "controlled_redirects", t)
-end
-function rs.remove(self, section)
-    self.map:del(section, "controlled_redirects")
+    if type(value) == "table" then
+        value = table.concat(value, " ")
+    end
+    self.map:set(section, "controlled_redirects", value)
 end
 
 -- ══════════════════════════════════════════
@@ -206,6 +200,40 @@ function wt.write(self, section)
         "wget -q -O /tmp/.rdp_wh_test 'http://127.0.0.1:%s/api/webhook/test' 2>/dev/null",
         port
     ))
+end
+
+-- ══════════════════════════════════════════
+-- 日志
+-- ══════════════════════════════════════════
+lg = m:section(NamedSection, "settings", "settings", translate("日志"))
+lg.addremove = false
+lg.anonymous = true
+
+local le = lg:option(Flag, "log_enabled", translate("启用日志记录"))
+le.default = "1"
+le.rmempty = false
+le.description = translate("关闭后服务不再写入日志（需保存后生效）")
+
+-- 日志内容（读取最后 200 行）
+local lvw = lg:option(DummyValue, "_log_view", translate("日志内容"))
+lvw.rawhtml = true
+function lvw.cfgvalue(self, section)
+    local content = luci_sys.exec("tail -n 200 /var/log/rdp_controller.log 2>/dev/null")
+    if not content or content == "" then
+        return "<span style='color:#9E9E9E'>" .. translate("（暂无日志）") .. "</span>"
+    end
+    content = content:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+    return "<pre style='max-height:360px;overflow:auto;background:#1e1e1e;color:#d4d4d4;"
+        .. "padding:10px;border-radius:4px;font-size:12px;line-height:1.5;margin:0'>"
+        .. content .. "</pre>"
+end
+
+-- 清除日志按钮
+local lc = lg:option(Button, "_clear_log", translate("&nbsp;"))
+lc.inputtitle = translate("🗑 清除日志")
+lc.inputstyle = "remove"
+function lc.write(self, section)
+    luci_sys.call(": > /var/log/rdp_controller.log 2>/dev/null")
 end
 
 -- ══════════════════════════════════════════
