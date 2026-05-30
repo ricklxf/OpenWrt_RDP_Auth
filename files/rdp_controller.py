@@ -757,8 +757,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         logger.info("[%s] %s", self.address_string(), format % args)
 
 def main():
-    # 日志开关：main.log_enabled 为 0 时关闭记录
-    if uci_get('rdp_controller', 'main', 'log_enabled', '1') != '1':
+    # 日志开关：settings.log_enabled 为 0 时关闭记录
+    if uci_get('rdp_controller', 'settings', 'log_enabled', '1') != '1':
         logger.setLevel(logging.CRITICAL)
 
     port = int(uci_get('rdp_controller', 'main', 'port', '8080'))

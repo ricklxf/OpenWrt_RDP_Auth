@@ -3,9 +3,11 @@ config rdp_controller 'main'
 	option port '8080'
 	option auth_enabled '0'
 	option password ''
-	option log_enabled '1'
-	option persist_on_restart '1'
 
-config webhook
+config settings 'settings'
+	option persist_on_restart '1'
+	option log_enabled '1'
+
+config webhook 'webhook'
 	option enabled '0'
 	option url ''

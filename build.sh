@@ -61,7 +61,32 @@ POSTINST = b"""\
 if [ -z "$IPKG_INSTROOT" ]; then
     chmod +x /usr/bin/rdp_controller.py 2>/dev/null || true
     chmod +x /etc/init.d/rdp_controller 2>/dev/null || true
+
+    # Config migration: older versions kept settings options under 'main'
+    # and used an anonymous webhook section. Normalize to named sections
+    # settings / webhook, preserving existing values.
+    changed=0
+    if ! uci -q get rdp_controller.settings >/dev/null 2>&1; then
+        uci set rdp_controller.settings=settings
+        uci set rdp_controller.settings.persist_on_restart="$(uci -q get rdp_controller.main.persist_on_restart 2>/dev/null || echo 1)"
+        uci set rdp_controller.settings.log_enabled="$(uci -q get rdp_controller.main.log_enabled 2>/dev/null || echo 1)"
+        uci -q delete rdp_controller.main.persist_on_restart 2>/dev/null || true
+        uci -q delete rdp_controller.main.log_enabled 2>/dev/null || true
+        changed=1
+    fi
+    if ! uci -q get rdp_controller.webhook >/dev/null 2>&1; then
+        wh_en="$(uci -q get rdp_controller.@webhook[0].enabled 2>/dev/null || echo 0)"
+        wh_url="$(uci -q get rdp_controller.@webhook[0].url 2>/dev/null || echo '')"
+        uci -q delete rdp_controller.@webhook[0] 2>/dev/null || true
+        uci set rdp_controller.webhook=webhook
+        uci set rdp_controller.webhook.enabled="$wh_en"
+        uci set rdp_controller.webhook.url="$wh_url"
+        changed=1
+    fi
+    [ "$changed" = 1 ] && uci commit rdp_controller
+
     /etc/init.d/rdp_controller enable 2>/dev/null || true
+    /etc/init.d/rdp_controller restart 2>/dev/null || true
 fi
 exit 0
 """
