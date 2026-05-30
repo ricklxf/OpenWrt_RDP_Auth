@@ -57,26 +57,34 @@ def uci_show(config):
         return ''
 
 def get_all_redirects():
-    redirects = []
-    uci_output = uci_show('firewall')
-    
-    current_redirect = None
-    for line in uci_output.split('\n'):
+    """解析 uci show firewall，返回所有 redirect 段。
+
+    兼容两种段标识写法（新旧 OpenWrt 都覆盖）：
+      firewall.cfg0392c5=redirect          ← 新版匿名段用 cfg-id
+      firewall.@redirect[0]=redirect        ← 旧版 @type[index]
+    'index' 存段标识（cfg-id 或 @redirect[N]），可直接用于 uci set。
+    """
+    sections = {}
+    order = []
+    for line in uci_show('firewall').split('\n'):
         line = line.strip()
-        if line.startswith('firewall.@redirect['):
-            if current_redirect:
-                redirects.append(current_redirect)
-            current_redirect = {'index': line.split('[')[1].split(']')[0]}
-        elif '=' in line and current_redirect is not None:
-            key, value = line.split('=', 1)
-            key = key.split('.')[-1]
-            value = value.strip('\'')
-            current_redirect[key] = value
-    
-    if current_redirect:
-        redirects.append(current_redirect)
-    
-    return redirects
+        if '=' not in line:
+            continue
+        left, value = line.split('=', 1)
+        value = value.strip().strip('\'"')
+        parts = left.split('.')
+        if len(parts) == 2:
+            # 段声明：firewall.<secid>=<type>
+            if value == 'redirect':
+                secid = parts[1]
+                sections[secid] = {'index': secid}
+                order.append(secid)
+        elif len(parts) == 3:
+            # 段选项：firewall.<secid>.<key>=<value>
+            secid, key = parts[1], parts[2]
+            if secid in sections:
+                sections[secid][key] = value
+    return [sections[s] for s in order]
 
 def get_controllable_redirects():
     """读取被勾选的可控端口转发名称。
@@ -108,11 +116,12 @@ def get_controllable_redirects():
     logger.info("controlled_redirects = %r", names)
     return names
 
-def toggle_redirect_enabled(index, enabled):
+def toggle_redirect_enabled(secid, enabled):
     state = '1' if enabled else '0'
-    subprocess.run(['uci', 'set', f'firewall.@redirect[{index}].enabled={state}'], check=False)
+    subprocess.run(['uci', 'set', f'firewall.{secid}.enabled={state}'], check=False)
     subprocess.run(['uci', 'commit', 'firewall'], check=False)
     subprocess.run(['/etc/init.d/firewall', 'reload'], check=False)
+    logger.info("redirect %s -> enabled=%s", secid, state)
 
 def send_feishu_webhook(message):
     webhook_enabled = uci_get('rdp_controller', 'webhook', 'enabled', '0') == '1'
@@ -590,7 +599,8 @@ class RequestHandler(BaseHTTPRequestHandler):
                 name = data.get('name')
                 index = data.get('index')
                 minutes = data.get('minutes', 30)
-                
+                logger.info("timer/start name=%r index=%r minutes=%r", name, index, minutes)
+
                 if not name or index is None:
                     self.send_response(400)
                     self.send_header('Content-type', 'application/json')

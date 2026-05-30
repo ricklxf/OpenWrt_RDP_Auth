@@ -203,19 +203,19 @@ function wt.write(self, section)
 end
 
 -- ══════════════════════════════════════════
--- 日志
+-- 日志与其他设置（同一 settings 段，合并为单个 section 避免 DOM id 冲突）
 -- ══════════════════════════════════════════
-lg = m:section(NamedSection, "settings", "settings", translate("日志"))
-lg.addremove = false
-lg.anonymous = true
+s2 = m:section(NamedSection, "settings", "settings", translate("日志"))
+s2.addremove = false
+s2.anonymous = true
 
-local le = lg:option(Flag, "log_enabled", translate("启用日志记录"))
+local le = s2:option(Flag, "log_enabled", translate("启用日志记录"))
 le.default = "1"
 le.rmempty = false
 le.description = translate("关闭后服务不再写入日志（需保存后生效）")
 
 -- 日志内容（读取最后 200 行）
-local lvw = lg:option(DummyValue, "_log_view", translate("日志内容"))
+local lvw = s2:option(DummyValue, "_log_view", translate("日志内容"))
 lvw.rawhtml = true
 function lvw.cfgvalue(self, section)
     local content = luci_sys.exec("tail -n 200 /var/log/rdp_controller.log 2>/dev/null")
@@ -229,20 +229,14 @@ function lvw.cfgvalue(self, section)
 end
 
 -- 清除日志按钮
-local lc = lg:option(Button, "_clear_log", translate("&nbsp;"))
+local lc = s2:option(Button, "_clear_log", translate("&nbsp;"))
 lc.inputtitle = translate("🗑 清除日志")
 lc.inputstyle = "remove"
 function lc.write(self, section)
     luci_sys.call(": > /var/log/rdp_controller.log 2>/dev/null")
 end
 
--- ══════════════════════════════════════════
--- 其他设置
--- ══════════════════════════════════════════
-s2 = m:section(NamedSection, "settings", "settings", translate("其他设置"))
-s2.addremove = false
-s2.anonymous = true
-
+-- 倒计时持久化
 local pr = s2:option(Flag, "persist_on_restart", translate("重启后保持倒计时"))
 pr.default = "1"
 pr.rmempty = false
