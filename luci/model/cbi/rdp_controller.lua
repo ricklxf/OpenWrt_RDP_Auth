@@ -203,9 +203,11 @@ function wt.write(self, section)
 end
 
 -- ══════════════════════════════════════════
--- 日志与其他设置（同一 settings 段，合并为单个 section 避免 DOM id 冲突）
+-- 日志与其他设置
+-- 挂到 main 段（具名段，一定存在）；settings 是匿名段，升级保留旧配置时
+-- 可能不存在，NamedSection 找不到对应段就不渲染 —— 这才是日志界面消失的根因
 -- ══════════════════════════════════════════
-s2 = m:section(NamedSection, "settings", "settings", translate("日志"))
+s2 = m:section(NamedSection, "main", "rdp_controller", translate("日志"))
 s2.addremove = false
 s2.anonymous = true
 

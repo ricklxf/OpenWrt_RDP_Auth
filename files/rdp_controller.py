@@ -10,8 +10,14 @@ from datetime import datetime
 import threading
 import hashlib
 import socket
+import socketserver
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    """多线程 HTTP 服务器：单个慢请求（如 firewall reload）不会阻塞其他请求。"""
+    daemon_threads = True
 
 # ── 日志 ────────────────────────────────────────────────────────────────────
 LOG_FILE = '/var/log/rdp_controller.log'
@@ -155,7 +161,7 @@ def send_feishu_webhook(message):
         return False
 
 def save_timer_state():
-    persist = uci_get('rdp_controller', 'settings', 'persist_on_restart', '1') == '1'
+    persist = uci_get('rdp_controller', 'main', 'persist_on_restart', '1') == '1'
     if persist:
         with timer_lock:
             with open(TIMER_STATE_FILE, 'w') as f:
@@ -419,30 +425,38 @@ def main_page():
             }
         }
         
+        let countdownTimer = null;
         function updateTimers(timers) {
-            const interval = setInterval(() => {
+            // 先清除上一个定时器，否则每次 loadRedirects 都会新建一个，
+            // 定时器不断累积最终导致页面卡死
+            if (countdownTimer) {
+                clearInterval(countdownTimer);
+                countdownTimer = null;
+            }
+            countdownTimer = setInterval(() => {
                 const now = Date.now();
                 let allExpired = true;
-                
+
                 for (const [name, timer] of Object.entries(timers)) {
                     const fillEl = document.getElementById(`fill-${encodeURIComponent(name)}`);
                     const timeEl = document.getElementById(`time-${encodeURIComponent(name)}`);
-                    
+
                     if (fillEl && timeEl) {
                         const total = timer.end_time * 1000 - timer.start_time * 1000;
                         const remaining = Math.max(0, timer.end_time * 1000 - now);
                         const percent = (remaining / total) * 100;
-                        
+
                         fillEl.style.width = percent + '%';
                         fillEl.style.background = getColorClass(percent);
                         timeEl.textContent = formatTime(remaining);
-                        
+
                         if (remaining > 0) allExpired = false;
                     }
                 }
-                
+
                 if (allExpired) {
-                    clearInterval(interval);
+                    clearInterval(countdownTimer);
+                    countdownTimer = null;
                     loadRedirects();
                 }
             }, 1000);
@@ -707,8 +721,8 @@ class RequestHandler(BaseHTTPRequestHandler):
         logger.info("[%s] %s", self.address_string(), format % args)
 
 def main():
-    # 日志开关：settings.log_enabled 为 0 时关闭记录
-    if uci_get('rdp_controller', 'settings', 'log_enabled', '1') != '1':
+    # 日志开关：main.log_enabled 为 0 时关闭记录
+    if uci_get('rdp_controller', 'main', 'log_enabled', '1') != '1':
         logger.setLevel(logging.CRITICAL)
 
     port = int(uci_get('rdp_controller', 'main', 'port', '8080'))
@@ -716,7 +730,7 @@ def main():
 
     threading.Thread(target=timer_thread, daemon=True).start()
 
-    server = HTTPServer(('0.0.0.0', port), RequestHandler)
+    server = ThreadedHTTPServer(('0.0.0.0', port), RequestHandler)
     logger.info("Server ready, log: %s", LOG_FILE)
 
     try:
