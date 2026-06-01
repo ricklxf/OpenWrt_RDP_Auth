@@ -4,8 +4,6 @@ config rdp_controller 'main'
 	option auth_enabled '0'
 	option password ''
 	option wol_mac ''
-
-config settings 'settings'
 	option persist_on_restart '1'
 	option log_enabled '1'
 

@@ -21,12 +21,15 @@ class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
     daemon_threads = True
 
 # ── 日志 ────────────────────────────────────────────────────────────────────
+import logging.handlers
 LOG_FILE = '/var/log/rdp_controller.log'
 _fmt = logging.Formatter('%(asctime)s %(levelname)s %(message)s', '%Y-%m-%d %H:%M:%S')
 logger = logging.getLogger('rdp_controller')
 logger.setLevel(logging.INFO)
 try:
-    _fh = logging.FileHandler(LOG_FILE)
+    # WatchedFileHandler：当日志文件被删除时，下次写入自动重建，
+    # 这样 LuCI 上「删除日志」后服务仍能继续记录。
+    _fh = logging.handlers.WatchedFileHandler(LOG_FILE)
     _fh.setFormatter(_fmt)
     logger.addHandler(_fh)
 except OSError:
@@ -213,40 +216,47 @@ def send_wol(mac):
         return False, str(e)
 
 def send_feishu_webhook(message):
-    webhook_enabled = uci_get('rdp_controller', 'webhook', 'enabled', '0') == '1'
-    webhook_url = uci_get('rdp_controller', 'webhook', 'url', '')
-    
-    if not webhook_enabled or not webhook_url:
-        return False
-    
+    """发送飞书通知。返回 (是否成功, 说明文本)。
+
+    飞书自定义机器人即使逻辑失败也返回 HTTP 200，需解析 body 里的
+    code/StatusCode 才能判断是否真的成功（如开启签名校验会返回错误码）。
+    """
+    enabled = uci_get('rdp_controller', 'webhook', 'enabled', '0')
+    url = uci_get('rdp_controller', 'webhook', 'url', '')
+
+    if enabled != '1':
+        logger.warning("飞书通知未启用 (enabled=%r)，跳过发送", enabled)
+        return False, '飞书通知未启用'
+    if not url:
+        logger.warning("飞书 Webhook 地址为空，跳过发送")
+        return False, 'Webhook 地址为空'
+
     try:
         import urllib.request
-        payload = json.dumps({
-            'msg_type': 'text',
-            'content': {'text': message}
-        }).encode('utf-8')
-        
-        req = urllib.request.Request(
-            webhook_url,
-            data=payload,
-            headers={'Content-Type': 'application/json'}
-        )
-        
-        with urllib.request.urlopen(req, timeout=5) as response:
-            ok = response.status == 200
-            if ok:
-                logger.info("Webhook sent ok")
-            else:
-                logger.warning("Webhook returned status %d", response.status)
-            return ok
+        payload = json.dumps({'msg_type': 'text', 'content': {'text': message}}).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, headers={'Content-Type': 'application/json'})
+        with urllib.request.urlopen(req, timeout=8) as response:
+            body = response.read().decode('utf-8', 'ignore')
+            logger.info("飞书响应 status=%s body=%s", response.status, body[:300])
+            try:
+                j = json.loads(body)
+            except Exception:
+                # 无法解析则以 HTTP 状态码为准
+                return (response.status == 200), f'HTTP {response.status}'
+            # 成功：StatusCode==0（旧接口）或 code==0（新接口）
+            if j.get('StatusCode') == 0 or j.get('code') == 0:
+                return True, '发送成功'
+            err = j.get('msg') or j.get('StatusMessage') or body[:120]
+            logger.warning("飞书返回错误: %s", err)
+            return False, f'飞书拒绝: {err}'
     except Exception as e:
-        logger.error("Webhook failed: %s", e)
-        return False
+        logger.error("飞书 Webhook 请求失败: %s", e)
+        return False, f'请求失败: {e}'
 
 def save_timer_state(snapshot):
     """把计时器快照写入磁盘。snapshot 由调用方在锁内复制好，
     本函数不再获取 timer_lock —— 之前在持锁上下文里再次抢锁会死锁。"""
-    persist = uci_get('rdp_controller', 'settings', 'persist_on_restart', '1') == '1'
+    persist = uci_get('rdp_controller', 'main', 'persist_on_restart', '1') == '1'
     if not persist:
         return
     try:
@@ -661,8 +671,7 @@ class RequestHandler(BaseHTTPRequestHandler):
         elif path == '/api/webhook/test':
             # LuCI 测试按钮用 wget(GET) 触发，这里也要受理
             test_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            ok = send_feishu_webhook(f"🔔 Port-Control 测试通知: {test_time}")
-            msg = '测试消息已发送' if ok else '发送失败：请确认已勾选启用、填写正确的 Webhook 地址并已保存'
+            ok, msg = send_feishu_webhook(f"🔔 Port-Control 测试通知: {test_time}")
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
@@ -800,15 +809,11 @@ class RequestHandler(BaseHTTPRequestHandler):
         
         elif path == '/api/webhook/test':
             test_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            success = send_feishu_webhook(f"🔔 测试消息: {test_time}")
-
+            success, message = send_feishu_webhook(f"🔔 测试消息: {test_time}")
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
-            if success:
-                self.wfile.write(json.dumps({'success': True, 'message': '测试消息发送成功'}).encode('utf-8'))
-            else:
-                self.wfile.write(json.dumps({'success': False, 'message': '测试消息发送失败，请检查配置'}).encode('utf-8'))
+            self.wfile.write(json.dumps({'success': success, 'message': message}).encode('utf-8'))
 
         elif path == '/api/wol':
             if not self.check_auth():
@@ -838,7 +843,7 @@ class RequestHandler(BaseHTTPRequestHandler):
 
 def main():
     # 日志开关：settings.log_enabled 为 0 时关闭记录
-    if uci_get('rdp_controller', 'settings', 'log_enabled', '1') != '1':
+    if uci_get('rdp_controller', 'main', 'log_enabled', '1') != '1':
         logger.setLevel(logging.CRITICAL)
 
     port = int(uci_get('rdp_controller', 'main', 'port', '8080'))

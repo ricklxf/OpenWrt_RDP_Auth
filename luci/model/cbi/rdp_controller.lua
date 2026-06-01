@@ -200,18 +200,31 @@ local wt = w:option(Button, "_test_wh", translate("&nbsp;"))
 wt.inputtitle = translate("发送测试通知")
 wt.inputstyle = "reload"
 wt:depends("enabled", "1")
+-- 走服务真实发送路径（与倒计时通知同一代码），并把结果写入临时文件供显示
 function wt.write(self, section)
     local port = uci:get("rdp_controller", "main", "port") or "8080"
-    luci_sys.call(string.format(
-        "wget -q -O /tmp/.rdp_wh_test 'http://127.0.0.1:%s/api/webhook/test' 2>/dev/null",
-        port
-    ))
+    local out = luci_sys.exec(string.format(
+        "wget -q -O - 'http://127.0.0.1:%s/api/webhook/test' 2>&1", port)) or ""
+    local f = io.open("/tmp/rdp_wh_test", "w")
+    if f then f:write(os.date("%H:%M:%S") .. " " .. out); f:close() end
+end
+
+-- 测试结果显示
+local wr = w:option(DummyValue, "_wh_result", translate("测试结果"))
+wr.rawhtml = true
+wr:depends("enabled", "1")
+function wr.cfgvalue(self, section)
+    local out = luci_sys.exec("cat /tmp/rdp_wh_test 2>/dev/null") or ""
+    out = out:gsub("%s+$", "")
+    if out == "" then
+        return "<span style='color:#9E9E9E'>" .. translate("点击上方「发送测试通知」，结果将显示在此（请先保存并应用）") .. "</span>"
+    end
+    out = out:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
+    return "<code style='font-size:12px'>" .. out .. "</code>"
 end
 
 -- ══════════════════════════════════════════
--- 日志与其他设置
--- 挂到 main 段（具名段，一定存在）；settings 是匿名段，升级保留旧配置时
--- 可能不存在，NamedSection 找不到对应段就不渲染 —— 这才是日志界面消失的根因
+-- 日志（挂到 main 具名段，始终存在且与 Python 读取一致）
 -- ══════════════════════════════════════════
 s2 = m:section(NamedSection, "main", "rdp_controller", translate("日志"))
 s2.addremove = false
@@ -222,13 +235,65 @@ le.default = "1"
 le.rmempty = false
 le.description = translate("关闭后服务不再写入日志（需保存后生效）")
 
--- 日志内容（读取最后 200 行）
+local pr = s2:option(Flag, "persist_on_restart", translate("重启后保持倒计时"))
+pr.default = "1"
+pr.rmempty = false
+
+-- 日志文件路径（静态）
+local lp = s2:option(DummyValue, "_log_path", translate("日志文件路径"))
+lp.rawhtml = true
+function lp.cfgvalue(self, section)
+    return "<code>/var/log/rdp_controller.log</code>"
+end
+
+-- 日志文件大小（仅在点击「读取日志」时更新）
+local ls = s2:option(DummyValue, "_log_size", translate("日志文件大小"))
+ls.rawhtml = true
+function ls.cfgvalue(self, section)
+    local meta = (luci_sys.exec("head -n1 /tmp/rdp_log_view 2>/dev/null") or ""):gsub("%s+$", "")
+    if meta == "" then
+        return "<span style='color:#9E9E9E'>" .. translate("未读取") .. "</span>"
+    end
+    if meta:match("^MISSING") then
+        local t = meta:match("^MISSING%s+(.*)$") or ""
+        return "<span style='color:#f44336'>" .. translate("日志文件不存在") ..
+               "</span> <span style='color:#999'>(读取于 " .. t .. ")</span>"
+    end
+    local size, t = meta:match("^OK%s+(%S+)%s+(.*)$")
+    if size then
+        return string.format("<b>%s</b> 字节 <span style='color:#999'>(读取于 %s)</span>", size, t or "")
+    end
+    return meta
+end
+
+-- 读取日志按钮：把大小+内容快照写入临时文件（能处理文件被删的情况）
+local lr = s2:option(Button, "_read_log", translate("&nbsp;"))
+lr.inputtitle = translate("📖 读取日志")
+lr.inputstyle = "reload"
+function lr.write(self, section)
+    luci_sys.call(
+        "L=/var/log/rdp_controller.log; O=/tmp/rdp_log_view; " ..
+        "if [ -f \"$L\" ]; then " ..
+        "echo \"OK $(wc -c < \"$L\" | tr -d ' ') $(date '+%Y-%m-%d %H:%M:%S')\" > \"$O\"; " ..
+        "tail -n 300 \"$L\" >> \"$O\"; " ..
+        "else echo \"MISSING $(date '+%Y-%m-%d %H:%M:%S')\" > \"$O\"; fi"
+    )
+end
+
+-- 日志内容（读取后才显示）
 local lvw = s2:option(DummyValue, "_log_view", translate("日志内容"))
 lvw.rawhtml = true
 function lvw.cfgvalue(self, section)
-    local content = luci_sys.exec("tail -n 200 /var/log/rdp_controller.log 2>/dev/null")
-    if not content or content == "" then
-        return "<span style='color:#9E9E9E'>" .. translate("（暂无日志）") .. "</span>"
+    local meta = (luci_sys.exec("head -n1 /tmp/rdp_log_view 2>/dev/null") or ""):gsub("%s+$", "")
+    if meta == "" then
+        return "<span style='color:#9E9E9E'>" .. translate("点击「读取日志」查看内容") .. "</span>"
+    end
+    if meta:match("^MISSING") then
+        return "<span style='color:#f44336'>" .. translate("日志文件不存在（可能已被删除）") .. "</span>"
+    end
+    local content = luci_sys.exec("tail -n +2 /tmp/rdp_log_view 2>/dev/null") or ""
+    if content:gsub("%s+$", "") == "" then
+        return "<span style='color:#9E9E9E'>" .. translate("（日志为空）") .. "</span>"
     end
     content = content:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;")
     return "<pre style='max-height:360px;overflow:auto;background:#1e1e1e;color:#d4d4d4;"
@@ -236,17 +301,12 @@ function lvw.cfgvalue(self, section)
         .. content .. "</pre>"
 end
 
--- 清除日志按钮
-local lc = s2:option(Button, "_clear_log", translate("&nbsp;"))
-lc.inputtitle = translate("🗑 清除日志")
-lc.inputstyle = "remove"
-function lc.write(self, section)
-    luci_sys.call(": > /var/log/rdp_controller.log 2>/dev/null")
+-- 删除日志文件按钮（同时清掉读取快照）
+local ld = s2:option(Button, "_del_log", translate("&nbsp;"))
+ld.inputtitle = translate("🗑 删除日志文件")
+ld.inputstyle = "remove"
+function ld.write(self, section)
+    luci_sys.call("rm -f /var/log/rdp_controller.log /tmp/rdp_log_view 2>/dev/null")
 end
-
--- 倒计时持久化
-local pr = s2:option(Flag, "persist_on_restart", translate("重启后保持倒计时"))
-pr.default = "1"
-pr.rmempty = false
 
 return m
