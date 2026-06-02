@@ -89,6 +89,15 @@ function lv.cfgvalue(self, section)
     )
 end
 
+-- 配置文件路径提示
+local cf = s0:option(DummyValue, "_cfg_path", translate("配置文件"))
+cf.rawhtml = true
+function cf.cfgvalue(self, section)
+    return "实际配置: <code>/etc/config/rdp_controller</code><br/>" ..
+           "带注释说明: <code>/etc/rdp_controller.conf</code> " ..
+           "<span style='color:#999'>（保存后自动生成，仅供查阅）</span>"
+end
+
 -- 端口转发规则列表
 local pv = s0:option(DummyValue, "_fw_ports", translate("端口转发规则"))
 pv.rawhtml = true
@@ -195,6 +204,12 @@ local wu = w:option(Value, "url", translate("Webhook 地址"))
 wu:depends("enabled", "1")
 wu.rmempty = true
 wu.placeholder = "https://open.feishu.cn/open-apis/bot/v2/hook/..."
+
+local wk = w:option(Value, "keyword", translate("安全关键词"))
+wk:depends("enabled", "1")
+wk.rmempty = true
+wk.description = translate("若机器人开启了「自定义关键词」校验，请填写其中一个关键词；" ..
+    "否则飞书会拒收并报错 19024 Key Words Not Found。会自动加到每条消息前。")
 
 local wt = w:option(Button, "_test_wh", translate("&nbsp;"))
 wt.inputtitle = translate("发送测试通知")

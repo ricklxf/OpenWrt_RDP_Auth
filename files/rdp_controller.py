@@ -41,9 +41,22 @@ logger.addHandler(_sh)
 CONFIG_PATH = '/etc/config/rdp_controller'
 FIREWALL_CONFIG = '/etc/config/firewall'
 TIMER_STATE_FILE = '/tmp/rdp_timers.json'
+DOC_CONFIG = '/etc/rdp_controller.conf'   # 带注释的配置说明文件（自动生成）
 
 active_timers = {}
 timer_lock = threading.Lock()
+# 串行化所有防火墙操作：避免多线程并发 `firewall reload` 撑爆内存导致路由器卡死/重启
+firewall_lock = threading.Lock()
+
+def run_cmd(cmd, timeout=30):
+    """执行外部命令，带超时与异常保护，绝不让线程无限挂起。"""
+    try:
+        subprocess.run(cmd, check=False, timeout=timeout,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        logger.error("命令超时(%ss): %s", timeout, ' '.join(cmd))
+    except Exception as e:
+        logger.error("命令执行失败 %s: %s", ' '.join(cmd), e)
 
 def uci_get(config, section, option, default=''):
     try:
@@ -152,26 +165,36 @@ def cut_connections(redirect):
     for p in protos:
         # 删除进入该转发端口（DNAT 前的目的端口）的连接
         if src_dport:
-            subprocess.run(['conntrack', '-D', '-p', p, '--orig-port-dst', str(src_dport)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run_cmd(['conntrack', '-D', '-p', p, '--orig-port-dst', str(src_dport)], 10)
         # 删除指向内部目标（DNAT 后）的连接，覆盖回复方向
         if dest_ip and dest_port:
-            subprocess.run(['conntrack', '-D', '-p', p, '-d', str(dest_ip), '--dport', str(dest_port)],
-                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            run_cmd(['conntrack', '-D', '-p', p, '-d', str(dest_ip), '--dport', str(dest_port)], 10)
     logger.info("已清除 conntrack 连接: proto=%s src_dport=%s dest=%s:%s",
                 protos, src_dport, dest_ip, dest_port)
 
+def apply_redirect_states(changes):
+    """批量设置多个 redirect 的 enabled 状态，全程持锁且只 reload 一次。
+
+    changes: [(secid, enabled_bool), ...]
+    防火墙操作必须串行：并发 `firewall reload` 会瞬间占用大量内存，
+    低内存设备上可能 OOM 直接重启。
+    """
+    if not changes:
+        return
+    with firewall_lock:
+        for secid, en in changes:
+            run_cmd(['uci', 'set', f'firewall.{secid}.enabled={"1" if en else "0"}'], 10)
+        run_cmd(['uci', 'commit', 'firewall'], 15)
+        run_cmd(['/etc/init.d/firewall', 'reload'], 60)
+    for secid, en in changes:
+        logger.info("redirect %s -> enabled=%s", secid, '1' if en else '0')
+
 def toggle_redirect_enabled(secid, enabled):
-    state = '1' if enabled else '0'
-    subprocess.run(['uci', 'set', f'firewall.{secid}.enabled={state}'], check=False)
-    subprocess.run(['uci', 'commit', 'firewall'], check=False)
-    subprocess.run(['/etc/init.d/firewall', 'reload'], check=False)
-    logger.info("redirect %s -> enabled=%s", secid, state)
-    # 关闭时同时断开已建立的连接
-    if not enabled:
-        redirect = get_redirect_by_secid(secid)
-        if redirect:
-            cut_connections(redirect)
+    # 关闭前先取规则详情（此时字段仍可读），用于断开已建立连接
+    redirect = None if enabled else get_redirect_by_secid(secid)
+    apply_redirect_states([(secid, enabled)])
+    if not enabled and redirect:
+        cut_connections(redirect)
 
 def build_redirects_payload():
     """构造 /api/redirects 响应：受控的端口转发 + 当前计时器。"""
@@ -223,6 +246,7 @@ def send_feishu_webhook(message):
     """
     enabled = uci_get('rdp_controller', 'webhook', 'enabled', '0')
     url = uci_get('rdp_controller', 'webhook', 'url', '')
+    keyword = uci_get('rdp_controller', 'webhook', 'keyword', '')
 
     if enabled != '1':
         logger.warning("飞书通知未启用 (enabled=%r)，跳过发送", enabled)
@@ -230,6 +254,10 @@ def send_feishu_webhook(message):
     if not url:
         logger.warning("飞书 Webhook 地址为空，跳过发送")
         return False, 'Webhook 地址为空'
+
+    # 机器人开启「自定义关键词」校验时，消息必须包含该关键词，否则飞书报 19024
+    if keyword and keyword not in message:
+        message = f"【{keyword}】\n{message}"
 
     try:
         import urllib.request
@@ -277,32 +305,41 @@ def load_timer_state():
 def timer_thread():
     global active_timers
     active_timers = load_timer_state()
-    
+
     while True:
-        now = time.time()
-        expired = []
+        # 整个循环体用 try 兜底：任何异常都不应让计时线程退出
+        try:
+            now = time.time()
+            expired = []
 
-        # 锁内：只做到期判断、移除、快照（全是快速内存操作）
-        with timer_lock:
-            for redirect_name, timer_info in list(active_timers.items()):
-                if now >= timer_info.get('end_time', 0):
-                    expired.append((redirect_name, timer_info.get('index')))
-                    del active_timers[redirect_name]
-            snapshot = {k: v.copy() for k, v in active_timers.items()}
+            # 锁内：只做到期判断、移除、快照（全是快速内存操作）
+            with timer_lock:
+                for redirect_name, timer_info in list(active_timers.items()):
+                    if now >= timer_info.get('end_time', 0):
+                        expired.append((redirect_name, timer_info.get('index')))
+                        del active_timers[redirect_name]
+                snapshot = {k: v.copy() for k, v in active_timers.items()}
 
-        # 锁外：执行慢操作（firewall reload、webhook、写文件），避免阻塞 /api/redirects
-        if expired:
-            save_timer_state(snapshot)
-            for redirect_name, redirect_index in expired:
-                if redirect_index:
-                    logger.info("计时器到期: '%s' (index=%s)，关闭端口", redirect_name, redirect_index)
-                    toggle_redirect_enabled(redirect_index, False)
-                    closed_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    send_feishu_webhook(f"""🔒 端口转发已关闭
+            # 锁外执行慢操作；多个到期的端口合并为一次 firewall reload
+            if expired:
+                save_timer_state(snapshot)
+                changes = [(idx, False) for _, idx in expired if idx]
+                redirects = {idx: get_redirect_by_secid(idx) for _, idx in expired if idx}
+                apply_redirect_states(changes)
+                for redirect_name, redirect_index in expired:
+                    if redirect_index:
+                        logger.info("计时器到期: '%s' (index=%s)，关闭端口", redirect_name, redirect_index)
+                        r = redirects.get(redirect_index)
+                        if r:
+                            cut_connections(r)
+                        closed_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                        send_feishu_webhook(f"""🔒 端口转发已关闭
 ━━━━━━━━━━━━━━━
 📋 名称: {redirect_name}
 🕐 关闭时间: {closed_time}
 ━━━━━━━━━━━━━━━""")
+        except Exception as e:
+            logger.error("计时线程异常(已忽略继续运行): %s", e)
 
         time.sleep(1)
 
@@ -841,10 +878,70 @@ class RequestHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         logger.info("[%s] %s", self.address_string(), format % args)
 
+def write_config_doc():
+    """生成带详细注释的配置说明文件。
+
+    实际生效配置由 LuCI/UCI 管理（/etc/config/rdp_controller，UCI 提交时会丢注释），
+    本文件在每次保存导致服务重启时自动重新生成，供查阅当前配置。
+    """
+    def g(opt, d=''):
+        return uci_get('rdp_controller', 'main', opt, d)
+    def w(opt, d=''):
+        return uci_get('rdp_controller', 'webhook', opt, d)
+    try:
+        content = f"""# =====================================================================
+# Port-Control 配置说明（本文件自动生成，手动修改无效）
+# 实际生效配置: /etc/config/rdp_controller  （请在 LuCI「服务 → 端口控制」修改）
+# 每次在 LuCI 保存并应用后，本文件会自动重新生成
+# 生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+# =====================================================================
+
+## 基本设置 ##
+# 是否启用插件          1=启用  0=禁用
+enabled            = {g('enabled', '1')}
+# Web 管理界面端口
+port               = {g('port', '8080')}
+# 是否启用密码登录      1=启用  0=禁用
+auth_enabled       = {g('auth_enabled', '0')}
+# 访问密码（启用密码登录时生效）
+password           = {'******（已设置）' if g('password') else '（未设置）'}
+
+## 网络唤醒（Wake-on-LAN） ##
+# 目标主机 MAC，填写后管理页出现「唤醒主机」按钮，格式 AA:BB:CC:DD:EE:FF
+wol_mac            = {g('wol_mac') or '（未设置）'}
+
+## 飞书通知 ##
+# 是否启用飞书通知      1=启用  0=禁用
+webhook_enabled    = {w('enabled', '0')}
+# 飞书自定义机器人 Webhook 地址
+webhook_url        = {w('url') or '（未设置）'}
+# 安全关键词：若机器人开启「自定义关键词」校验，须填其中一个关键词，
+#            否则飞书拒收并报错 19024 Key Words Not Found
+webhook_keyword    = {w('keyword') or '（未设置）'}
+
+## 日志与计时 ##
+# 是否记录运行日志      1=启用  0=禁用
+log_enabled        = {g('log_enabled', '1')}
+# OpenWrt 重启后是否保持倒计时   1=是  0=否
+persist_on_restart = {g('persist_on_restart', '1')}
+
+## 相关文件 ##
+# 受控端口转发规则: /etc/config/firewall （仅修改其 enabled 状态）
+# 运行日志:        /var/log/rdp_controller.log
+# 倒计时持久化:     /tmp/rdp_timers.json
+"""
+        with open(DOC_CONFIG, 'w') as f:
+            f.write(content)
+        logger.info("已生成配置说明文件: %s", DOC_CONFIG)
+    except OSError as e:
+        logger.error("写配置说明文件失败: %s", e)
+
 def main():
-    # 日志开关：settings.log_enabled 为 0 时关闭记录
+    # 日志开关：main.log_enabled 为 0 时关闭记录
     if uci_get('rdp_controller', 'main', 'log_enabled', '1') != '1':
         logger.setLevel(logging.CRITICAL)
+
+    write_config_doc()
 
     port = int(uci_get('rdp_controller', 'main', 'port', '8080'))
     logger.info("=== rdp_controller starting on 0.0.0.0:%d ===", port)
