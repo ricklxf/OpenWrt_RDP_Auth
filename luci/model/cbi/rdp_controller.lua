@@ -139,6 +139,20 @@ function rb.write(self, section)
     refresh_status()
 end
 
+-- 停止所有转发按钮：清计时器 + 关闭所有受控端口 + 停服务
+local sa = s0:option(Button, "_stop_all_btn", translate("&nbsp;"))
+sa.inputtitle = translate("⛔ 停止所有")
+sa.inputstyle = "remove"
+function sa.write(self, section)
+    local port = uci:get("rdp_controller", "main", "port") or "8080"
+    luci_sys.call(string.format(
+        "wget -q -T 30 -O - 'http://127.0.0.1:%s/api/stop_all' >/dev/null 2>&1", port))
+    luci_sys.call("sleep 1")
+    luci_sys.call("/etc/init.d/rdp_controller stop >/dev/null 2>&1")
+    luci_sys.call("sleep 1")
+    refresh_status()
+end
+
 -- ══════════════════════════════════════════
 -- 服务设置
 -- ══════════════════════════════════════════
@@ -167,6 +181,17 @@ local wol = s:option(Value, "wol_mac", translate("网络唤醒 MAC 地址"))
 wol.placeholder = "AA:BB:CC:DD:EE:FF"
 wol.rmempty = true
 wol.description = translate("填写后，管理页面会出现「唤醒主机」按钮（发送 WoL 魔术包）")
+
+-- 网络唤醒目标 IP（用于 ping 检查在线状态）
+local wolip = s:option(Value, "wol_ip", translate("唤醒主机 IP 地址"))
+wolip.placeholder = "192.168.1.100"
+wolip.rmempty = true
+wolip.description = translate("填写后，管理页面会出现「检查在线状态」按钮（ping 一次，显示延迟或不在线）")
+
+-- 重启后保持倒计时
+local pr = s:option(Flag, "persist_on_restart", translate("重启后保持倒计时"))
+pr.default = "1"
+pr.rmempty = false
 
 -- 可控制的端口转发（复选框多选，存为 UCI list，空格安全）
 local rs = s:option(MultiValue, "controlled_redirects", translate("可控制的端口转发"))
@@ -249,10 +274,6 @@ local le = s2:option(Flag, "log_enabled", translate("启用日志记录"))
 le.default = "1"
 le.rmempty = false
 le.description = translate("关闭后服务不再写入日志（需保存后生效）")
-
-local pr = s2:option(Flag, "persist_on_restart", translate("重启后保持倒计时"))
-pr.default = "1"
-pr.rmempty = false
 
 -- 日志文件路径（静态）
 local lp = s2:option(DummyValue, "_log_path", translate("日志文件路径"))

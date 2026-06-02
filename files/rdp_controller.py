@@ -2,6 +2,7 @@
 
 import subprocess
 import json
+import re
 import time
 import os
 import sys
@@ -214,9 +215,10 @@ def build_redirects_payload():
     with timer_lock:
         timers_copy = {k: v.copy() for k, v in active_timers.items()}
     wol_mac = uci_get('rdp_controller', 'main', 'wol_mac', '')
+    wol_ip  = uci_get('rdp_controller', 'main', 'wol_ip',  '')
     logger.info("payload redirects=%r controlled=%r timers=%r",
                 [x['name'] for x in result], controlled, list(timers_copy.keys()))
-    return {'redirects': result, 'timers': timers_copy, 'wol_mac': wol_mac}
+    return {'redirects': result, 'timers': timers_copy, 'wol_mac': wol_mac, 'wol_ip': wol_ip}
 
 def send_wol(mac):
     """向指定 MAC 发送网络唤醒魔术包（UDP 广播到 9 端口）。"""
@@ -465,18 +467,34 @@ def main_page():
 </head>
 <body>
     <h1>端口转发控制器 <span style="font-size:14px;color:#999;">v__PKG_VERSION__</span></h1>
+    <div id="err-bar" style="display:none;background:#ffebee;color:#c62828;padding:8px 16px;border-radius:4px;margin:8px 0;text-align:center;font-size:14px;"></div>
     <div id="wol-bar" style="text-align:center;margin:10px 0;display:none;">
-        <button id="wol-btn" class="btn" style="background:#673AB7;padding:10px 22px;font-size:15px;" onclick="wakeHost()">🖥 唤醒主机</button>
+        <button id="wol-btn" class="btn" style="background:#673AB7;padding:10px 22px;font-size:15px;display:none;" onclick="wakeHost()">🖥 唤醒主机</button>
         <span id="wol-mac" style="margin-left:10px;color:#888;font-size:13px;"></span>
+        <span id="ping-wrap" style="display:none;">
+            <button id="ping-btn" class="btn" style="background:#0288D1;padding:10px 16px;font-size:14px;margin-left:10px;" onclick="pingHost()">🔍 检查在线状态</button>
+            <span id="ping-status" style="margin-left:8px;font-size:13px;color:#888;"></span>
+        </span>
     </div>
     <div class="container" id="redirect-list">
         加载中...
     </div>
 
     <script>
-        let state = { redirects: [], timers: {} };
+        let state = { redirects: [], timers: {}, wol_mac: '', wol_ip: '' };
         let lastSig = '';
         let ticking = null;
+        // busySet：请求飞行中时禁止同一项目重复点击，防止连环 alert 弹窗
+        const busySet = new Set();
+        let _errTimer = null;
+        function showError(msg) {
+            const el = document.getElementById('err-bar');
+            if (!el) return;
+            el.textContent = msg;
+            el.style.display = 'block';
+            clearTimeout(_errTimer);
+            _errTimer = setTimeout(() => { el.style.display = 'none'; }, 5000);
+        }
 
         function formatTime(ms) {
             const s = Math.floor(ms / 1000);
@@ -495,22 +513,41 @@ def main_page():
                 const data = await resp.json();
                 state.redirects = data.redirects || [];
                 state.timers = data.timers || {};
-                updateWolBar(data.wol_mac || '');
+                state.wol_mac = data.wol_mac || '';
+                state.wol_ip  = data.wol_ip  || '';
+                updateWolBar(state.wol_mac, state.wol_ip);
                 render(false);
             } catch (e) {
-                document.getElementById('redirect-list').innerHTML = '加载失败，请刷新页面';
+                // firewall reload 期间可能短暂断连，轮询静默失败，保留当前显示
             }
         }
 
-        // 仅在配置了 MAC 时显示唤醒按钮
-        function updateWolBar(mac) {
-            const bar = document.getElementById('wol-bar');
-            if (mac) {
-                document.getElementById('wol-mac').textContent = '目标: ' + mac;
-                bar.style.display = 'block';
-            } else {
-                bar.style.display = 'none';
+        function updateWolBar(mac, ip) {
+            const bar     = document.getElementById('wol-bar');
+            const wolBtn  = document.getElementById('wol-btn');
+            const pingWrap= document.getElementById('ping-wrap');
+            wolBtn.style.display = mac ? '' : 'none';
+            document.getElementById('wol-mac').textContent = mac ? '目标: ' + mac : '';
+            pingWrap.style.display = ip ? '' : 'none';
+            bar.style.display = (mac || ip) ? 'block' : 'none';
+        }
+
+        async function pingHost() {
+            const btn    = document.getElementById('ping-btn');
+            const status = document.getElementById('ping-status');
+            btn.disabled = true;
+            status.textContent  = '检测中...';
+            status.style.color  = '#888';
+            try {
+                const resp = await fetch('/api/ping', {cache: 'no-store'});
+                const data = await resp.json();
+                status.textContent = data.message;
+                status.style.color = data.online ? '#4CAF50' : '#F44336';
+            } catch (e) {
+                status.textContent = '请求失败';
+                status.style.color = '#F44336';
             }
+            btn.disabled = false;
         }
 
         async function wakeHost() {
@@ -566,13 +603,14 @@ def main_page():
                                  <span class="timer-label">分钟</span>
                                </div>`;
                     }
+                    const busy = busySet.has(r.name);
                     html += `<div class="redirect-item">
                         <span class="status-indicator ${on ? 'status-on' : 'status-off'}"></span>
                         <div class="redirect-name">${r.name}</div>
                         ${mid}
                         <div class="btn-group">
-                            <button class="btn btn-start" ${hasTimer ? 'disabled' : ''} onclick="startTimer('${nm}','${r.index}')">倒计时开启</button>
-                            <button class="btn btn-stop" ${hasTimer ? '' : 'disabled'} onclick="stopTimer('${nm}','${r.index}')">立刻结束</button>
+                            <button class="btn btn-start" ${(hasTimer || busy) ? 'disabled' : ''} onclick="startTimer('${nm}','${r.index}')">倒计时开启</button>
+                            <button class="btn btn-stop" ${(!hasTimer || busy) ? 'disabled' : ''} onclick="stopTimer('${nm}','${r.index}')">立刻结束</button>
                         </div>
                     </div>`;
                 }
@@ -612,6 +650,8 @@ def main_page():
 
         async function startTimer(encodedName, index) {
             const name = decodeURIComponent(encodedName);
+            if (busySet.has(name)) return;   // 防重复点击
+            busySet.add(name);
             const input = document.getElementById('minutes-' + encodedName);
             const minutes = (input && parseInt(input.value)) || 30;
             // 乐观更新：立即本地显示倒计时，无需等待服务器
@@ -628,18 +668,24 @@ def main_page():
                     loadRedirects();      // 用服务器真实时间校准
                 } else {
                     delete state.timers[name];
-                    render(true);
-                    alert('开启失败: ' + (data.message || '未知错误'));
+                    showError('开启失败: ' + (data.message || '未知错误'));
                 }
             } catch (e) {
+                // firewall reload 期间连接可能短暂中断，2s 后自动重试同步
                 delete state.timers[name];
+                showError('请求失败，服务可能正忙，稍后自动同步');
+                setTimeout(loadRedirects, 2000);
+            } finally {
+                busySet.delete(name);
                 render(true);
-                alert('请求失败: ' + e);
             }
         }
 
         async function stopTimer(encodedName, index) {
             const name = decodeURIComponent(encodedName);
+            if (busySet.has(name)) return;   // 防重复点击
+            busySet.add(name);
+            const prevTimer = state.timers[name];
             delete state.timers[name];   // 乐观移除
             render(true);
             try {
@@ -648,11 +694,15 @@ def main_page():
                     body: JSON.stringify({ name: name, index: index })
                 });
                 const data = await resp.json();
-                if (!data.success) alert('结束失败: ' + (data.message || ''));
+                if (!data.success) showError('结束失败: ' + (data.message || ''));
             } catch (e) {
-                alert('请求失败: ' + e);
+                state.timers[name] = prevTimer;   // 请求失败时还原乐观更新
+                showError('请求失败，服务可能正忙，稍后自动同步');
+            } finally {
+                busySet.delete(name);
+                render(true);
+                setTimeout(loadRedirects, 500);
             }
-            loadRedirects();
         }
 
         loadRedirects();
@@ -713,6 +763,53 @@ class RequestHandler(BaseHTTPRequestHandler):
             self.send_header('Content-type', 'application/json')
             self.end_headers()
             self.wfile.write(json.dumps({'success': ok, 'message': msg}).encode('utf-8'))
+
+        elif path == '/api/ping':
+            ip = uci_get('rdp_controller', 'main', 'wol_ip', '')
+            if not ip:
+                result = {'success': False, 'online': False, 'message': '未配置目标 IP，请在 LuCI 中填写唤醒主机 IP 地址'}
+            else:
+                try:
+                    r = subprocess.run(
+                        ['ping', '-c', '1', '-W', '1', ip],
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        text=True, timeout=5
+                    )
+                    if r.returncode == 0:
+                        m = re.search(r'time[=<](\d+\.?\d*)\s*ms', r.stdout)
+                        rtt = m.group(1) if m else '?'
+                        result = {'success': True, 'online': True, 'message': f'在线  延迟 {rtt} ms', 'ip': ip}
+                    else:
+                        result = {'success': True, 'online': False, 'message': '不在线（ping 超时或无法到达）', 'ip': ip}
+                except Exception as e:
+                    result = {'success': False, 'online': False, 'message': f'ping 失败: {e}', 'ip': ip}
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(result).encode('utf-8'))
+
+        elif path == '/api/stop_all':
+            # 清空所有计时器
+            with timer_lock:
+                cleared_count = len(active_timers)
+                active_timers.clear()
+            save_timer_state({})
+            # 关闭所有受控端口转发
+            controlled_names = set(get_controllable_redirects())
+            all_r = get_all_redirects()
+            changes = [(r['index'], False) for r in all_r if r.get('name') in controlled_names]
+            to_cut  = [r for r in all_r if r.get('name') in controlled_names]
+            if changes:
+                apply_redirect_states(changes)
+                for r in to_cut:
+                    cut_connections(r)
+            logger.info("stop_all: 清除 %d 个计时器，关闭 %d 个端口转发", cleared_count, len(changes))
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps(
+                {'success': True, 'message': f'已清除 {cleared_count} 个计时器，关闭 {len(changes)} 个端口转发'}
+            ).encode('utf-8'))
 
         else:
             self.send_response(404)
@@ -909,6 +1006,8 @@ password           = {'******（已设置）' if g('password') else '（未设�
 ## 网络唤醒（Wake-on-LAN） ##
 # 目标主机 MAC，填写后管理页出现「唤醒主机」按钮，格式 AA:BB:CC:DD:EE:FF
 wol_mac            = {g('wol_mac') or '（未设置）'}
+# 目标主机 IP，填写后管理页出现「检查在线状态」按钮（ping 一次）
+wol_ip             = {g('wol_ip') or '（未设置）'}
 
 ## 飞书通知 ##
 # 是否启用飞书通知      1=启用  0=禁用
