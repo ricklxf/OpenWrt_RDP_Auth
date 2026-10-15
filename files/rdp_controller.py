@@ -220,7 +220,20 @@ def build_redirects_payload():
                 [x['name'] for x in result], controlled, list(timers_copy.keys()))
     return {'redirects': result, 'timers': timers_copy, 'wol_mac': wol_mac, 'wol_ip': wol_ip}
 
-def send_wol(mac):
+def wol_iface(ip):
+    """确定魔术包的出口网卡：按目标 IP 查路由，查不到则用 br-lan。"""
+    if ip:
+        try:
+            r = subprocess.run(['ip', 'route', 'get', ip], stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, text=True, timeout=3)
+            m = re.search(r'\bdev\s+(\S+)', r.stdout)
+            if m:
+                return m.group(1)
+        except Exception as e:
+            logger.warning("查询 %s 的路由失败: %s", ip, e)
+    return 'br-lan'
+
+def send_wol(mac, ip=''):
     """向指定 MAC 发送网络唤醒魔术包（UDP 广播到 9 端口）。"""
     clean = mac.replace(':', '').replace('-', '').replace(' ', '').strip()
     if len(clean) != 12 or not all(c in '0123456789abcdefABCDEF' for c in clean):
@@ -230,12 +243,15 @@ def send_wol(mac):
         packet = b'\xff' * 6 + mac_bytes * 16
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        # 路由器上 255.255.255.255 会按默认路由从 WAN 发出，必须绑定到 LAN 网卡
+        iface = wol_iface(ip)
+        s.setsockopt(socket.SOL_SOCKET, getattr(socket, 'SO_BINDTODEVICE', 25), iface.encode())
         # 同时发往全局广播与 9 端口，提升不同网络环境下的成功率
         s.sendto(packet, ('255.255.255.255', 9))
         s.sendto(packet, ('255.255.255.255', 7))
         s.close()
-        logger.info("已发送网络唤醒魔术包: %s", mac)
-        return True, '已发送唤醒魔术包'
+        logger.info("已发送网络唤醒魔术包: %s（网卡 %s）", mac, iface)
+        return True, f'已从 {iface} 发送唤醒魔术包'
     except Exception as e:
         logger.error("网络唤醒失败: %s", e)
         return False, str(e)
@@ -960,7 +976,7 @@ class RequestHandler(BaseHTTPRequestHandler):
             if not mac:
                 ok, message = False, '未配置唤醒 MAC 地址，请先在 LuCI 中填写'
             else:
-                ok, message = send_wol(mac)
+                ok, message = send_wol(mac, uci_get('rdp_controller', 'main', 'wol_ip', ''))
             self.send_response(200)
             self.send_header('Content-type', 'application/json')
             self.end_headers()
